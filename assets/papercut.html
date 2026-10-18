@@ -1,0 +1,2010 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<base href="./">
+<title>Vibe MV · 层叠剪纸</title>
+<style>
+@font-face{font-family:'Kai';src:url('./fonts/kai500.ttf') format('truetype');font-weight:500;font-display:block}
+@font-face{font-family:'Hei';src:url('./fonts/hei300.otf') format('opentype');font-weight:300;font-display:block}
+@font-face{font-family:'Hei';src:url('./fonts/hei500.otf') format('opentype');font-weight:500;font-display:block}
+
+html,body{margin:0;padding:0;background:#0a1018;overflow:hidden}
+#stage{position:fixed;inset:0;overflow:hidden;
+  background:radial-gradient(ellipse at 50% 38%, #1b2b40 0%, #101a28 46%, #080d14 100%)}
+#art{position:absolute;inset:0;width:100%;height:100%;display:block}
+
+/* 纸纹：一次性栅格化，逐帧零成本。
+   混合模式必须是 overlay，不能是 soft-light——soft-light 在深色上几乎不起作用
+   （暗底 × 暗噪声还是暗底），全片的夜色纸纹就是这么被吃掉的。
+   overlay 对 0.5 中灰不改变，噪声的上下偏差都能显出来，深色上也有颗粒。 */
+#grain{position:absolute;inset:0;pointer-events:none;opacity:.62;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='260' height='260'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='4' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='260' height='260' filter='url(%23n)' opacity='0.55'/></svg>");
+  background-size:260px 260px}
+/* 纸纤维：横向拉长的噪声。它必须几乎看不见——
+   早先 opacity .30 + y 频率 0.09，在黄昏那块浅色天空上直接读成一屏扫描线
+   （像老电视/坏 JPEG 的横带）。纸纤维是「偶尔一条很淡的长丝」，不是栅格。 */
+#fiber{position:absolute;inset:0;pointer-events:none;opacity:.17;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='420' height='420'><filter id='f'><feTurbulence type='fractalNoise' baseFrequency='0.005 0.048' numOctaves='2'/><feColorMatrix type='saturate' values='0'/></filter><rect width='420' height='420' filter='url(%23f)'/></svg>");
+  background-size:420px 420px}
+#vignette{position:absolute;inset:0;pointer-events:none;
+  /* 两层叠加：椭圆暗角压四角 + 四边纸边内影。
+     只做椭圆暗角的话，九帧各画各的，接在一起不像同一张纸；
+     内影给出的是「这张纸有厚度、有边」的错觉，全片统一感靠它。 */
+  background:
+    radial-gradient(ellipse at 50% 44%, rgba(0,0,0,0) 36%, rgba(6,3,9,.26) 72%, rgba(3,1,5,.56) 100%),
+    radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0) 56%, rgba(0,0,0,.26) 100%);
+  box-shadow:inset 0 0 130px 26px rgba(0,0,0,.32),
+             inset 0 0 0 3px rgba(255,246,226,.05)}
+#fade{position:absolute;inset:0;pointer-events:none;background:#000;opacity:0}
+
+/* 纸片字幕：一字一纸，各自微旋 */
+#lyric{position:absolute;left:0;right:0;bottom:9.5%;display:flex;justify-content:center;
+  align-items:flex-end;gap:0;pointer-events:none;opacity:0}
+#lyric .ch{display:inline-block;font-family:'Kai';font-weight:500;
+  font-size:var(--chsize,58px);line-height:1;padding:.22em .20em .26em;
+  color:#4a4136;background:#f3e7cf;
+  box-shadow:0 3px 0 rgba(0,0,0,.10), 0 8px 14px rgba(0,0,0,.22);
+  border-radius:2px;transform-origin:50% 60%;
+  transition:none;will-change:transform}
+#lyric .ch.on{color:#fff5e6;background:#e0632f;
+  box-shadow:0 3px 0 rgba(120,40,10,.28), 0 10px 20px rgba(200,80,30,.30)}
+#lyric .ch.sp{background:none;box-shadow:none;padding:0 .12em}
+</style>
+</head>
+<body>
+<div id="stage">
+  <svg id="art" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg>
+  <div id="vignette"></div>
+  <div id="fiber"></div>
+  <div id="grain"></div>
+  <div id="lyric"></div>
+  <div id="fade"></div>
+</div>
+<script id="story">window.STORY = /*__STORY__*/null/*__STORY__*/;</script>
+<script>
+'use strict';
+/* ==========================================================================
+   Vibe MV · 层叠剪纸渲染引擎
+   铁律：seek(t) 必须是纯函数。第 N 帧长什么样，只由 t 决定。
+   不读 Date、不读随机数（随机数一律 seed 化）、不依赖上一帧状态。
+   ========================================================================== */
+/* ---------------- 0. 故事配置 ---------------- */
+const STORY = window.STORY || {
+  width: 1920, height: 1080, fps: 30, duration: 24.17, bpm: 128,
+  scenes: [], lyrics: []
+};
+
+const W = STORY.width || 1920;
+const H = STORY.height || 1080;
+
+/* ---------------- 1. 数学与缓动 ---------------- */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, p) => a + (b - a) * p;
+/** 归一化进度：t 在 [a,b] 内的位置，自动 clamp 到 0..1 */
+const prog = (t, a, b) => clamp((t - a) / (Math.abs(b - a) < 1e-6 ? 1e-6 : b - a), 0, 1);
+const easeOut = p => 1 - Math.pow(1 - p, 3);
+const easeOutQuint = p => 1 - Math.pow(1 - p, 5);
+const easeIn = p => p * p * p;
+const easeInOut = p => p < .5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+/** 回弹：纸片被“弹”出来时用，过冲约 8% */
+const easeOutBack = p => 1 + 2.0 * Math.pow(p - 1, 3) + 1.2 * Math.pow(p - 1, 2);
+
+/* ---------------- 1b. 颜色 ----------------
+   纸的层次全靠「每层差一点点」。差多少必须算出来，不能凭感觉给常数。 */
+
+/** rgba(...) / #rrggbb → {r,g,b,a}。描边要按高度衰减，就得先拿到它的透明度。 */
+function rgbaParts(col) {
+  const s = String(col || '#888').trim();
+  const m = /^rgba?\(([^)]+)\)$/.exec(s);
+  if (m) {
+    const p = m[1].split(',').map(x => parseFloat(x));
+    return { r: p[0] | 0, g: p[1] | 0, b: p[2] | 0, a: p[3] == null ? 1 : p[3] };
+  }
+  const hx = /^#?([0-9a-f]{6})$/i.exec(s);
+  if (hx) {
+    const v = parseInt(hx[1], 16);
+    return { r: v >> 16 & 255, g: v >> 8 & 255, b: v & 255, a: 1 };
+  }
+  return { r: 136, g: 136, b: 136, a: 1 };
+}
+
+/** 两色按 t 混合（t=0 取 a，t=1 取 b）。海面层数超过色板档数时用它补插。 */
+function mixHex(a, b, t) {
+  const A = rgbaParts(a), B = rgbaParts(b);
+  const k = clamp(t, 0, 1);
+  const h = v => Math.round(v).toString(16).padStart(2, '0');
+  return '#' + h(lerp(A.r, B.r, k)) + h(lerp(A.g, B.g, k)) + h(lerp(A.b, B.b, k));
+}
+
+/**
+ * 镜内计时器。返回 at(u)：把「这一镜的百分之几」换算成最近的整拍号。
+ *
+ * 为什么必须用它：beatPos(t) 拿到的是「本镜内秒数换算出的拍数」，而一镜往往只有
+ * 3~8 拍。若窗口直接写死「第 6 拍→第 8 拍」，短镜头里的动效根本播不完——
+ * 第 9 镜的淡出会永远不触发，第 8 镜的第二段推镜根本不会开始。
+ * 用 at(u) 写窗口，动效既永远踩在整拍上，又能随镜头长短自动伸缩。
+ * 渲染前会打印每镜拍数，写窗口超过 NB 的一律视为 bug。
+ */
+function timing(dur) {
+  const NB = Math.max(1, (dur || BEAT) / BEAT);
+  return u => Math.round(clamp(u, 0, 1) * NB);
+}
+const smooth = p => p * p * (3 - 2 * p);
+
+/** 确定性伪随机：同一个 seed 永远同一串数，保证可重渲染 */
+function rng(seed) {
+  let s = (seed | 0) || 1;
+  return () => {
+    s = (s * 1664525 + 1013904223) & 0x7fffffff;
+    return s / 0x7fffffff;
+  };
+}
+
+/* ---------------- 2. 节拍网格 ---------------- */
+const BPM = STORY.bpm || 128;
+const BEAT = 60 / BPM;
+const OFFSET = STORY.offset || 0;
+/** 第 n 拍的时刻 */
+const beatT = n => OFFSET + n * BEAT;
+/** t 落在第几拍（含小数） */
+const beatPos = t => (t - OFFSET) / BEAT;
+/** 每拍一次脉冲：拍点处为 1，到下一拍衰减到 0。exp 越大衰减越快 */
+function pulse(t, every = 1, exp = 2.2) {
+  const b = beatPos(t) / every;
+  const ph = b - Math.floor(b);
+  return Math.pow(1 - ph, exp);
+}
+/** 阶梯值：第 n 个 every 拍区间内恒为 n（卡点做“逐层”动效常用） */
+const stepAt = (t, every = 1) => Math.floor(beatPos(t) / every);
+
+/* ---------------- 3. 色板 ---------------- */
+/* 剪纸片的颜色必须是“纸的颜色”，不是屏幕的颜色：全部降饱和、略偏黄。 */
+/* 色彩剧本：全片一条弧线 —— 冷夜 → 暖暮 → 冷夜收尾。
+   每一档只差明度和极小的色相偏移，镜头之间才是「顺着流」而不是「跳色」。
+   sea 是四层海面，从远到近、从浅到深；glow 是环境光，warm 是暖光源。 */
+const PAL = {
+  night: {  // ① 启航：冷夜，天最亮
+    sky: ['#1a2e46', '#0a141f'], moon: '#f7eed6',
+    sea: ['#35688a', '#264e69', '#17364a', '#0c1f2e'],
+    ink: '#070f18', glow: '#a8c9e6', warm: '#e8b878'
+  },
+  deep: {   // ② 孤夜：压到最暗
+    sky: ['#101f31', '#060d16'], moon: '#efe6cd',
+    sea: ['#2b5170', '#1d3e59', '#112a3d', '#081724'],
+    ink: '#050a11', glow: '#7d9fbe', warm: '#c99a63'
+  },
+  dusk1: {  // ③④ 蓝紫过渡：冷色开始破
+    sky: ['#2b2e4c', '#141828'], moon: '#f2e2c4',
+    sea: ['#474f7c', '#373f63', '#262e48', '#161a2e'],
+    ink: '#0d1020', glow: '#b9a8d0', warm: '#e0a877'
+  },
+  dusk2: {  // ⑤⑥ 暮色玫瑰：全片最暖
+    // 原先 sky[0]=#b9757e 太亮太粉，第 4→5 镜像被人把灯一下开到底；
+    // 压成灰玫瑰之后，暖是「慢慢渗出来的」，不是跳色。
+    sky: ['#8c5b67', '#482c3b'], moon: '#fff0d8',
+    sea: ['#ab6c78', '#8a5663', '#6a3e4b', '#452630'],
+    ink: '#241420', glow: '#e8b5a8', warm: '#ffc48a'
+  },
+  ember: {  // ⑦ 灯火：暖褐
+    sky: ['#3a2430', '#1a1018'], moon: '#ffd88f',
+    sea: ['#67434f', '#4f313d', '#37222c', '#1f1318'],
+    ink: '#150c12', glow: '#e8a860', warm: '#ffbe72'
+  },
+  mauve: {  // ⑧ 你眼中：深紫
+    sky: ['#241b2e', '#0e0a14'], moon: '#f6e3bb',
+    sea: ['#463a60', '#34294a', '#221a35', '#140d1f'],
+    ink: '#0a070e', glow: '#c9a8c8', warm: '#e8b878'
+  },
+  back: {   // ⑨ 尾声：回到冷夜
+    sky: ['#16283c', '#0c1622'], moon: '#f7eed6',
+    sea: ['#26496b', '#1a3550', '#0f2436', '#071421'],
+    ink: '#070f18', glow: '#a8c9e6', warm: '#e8b878'
+  },
+};
+
+/* ---------------- 4. SVG 小工具 ---------------- */
+const SVGNS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  if (attrs) for (const k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const g_ = (parent, attrs) => mk('g', attrs, parent);
+const path_ = (d, fill, parent, extra) => mk('path', Object.assign({ d, fill }, extra || {}), parent);
+const circ = (cx, cy, r, fill, parent, extra) => mk('circle', Object.assign({ cx, cy, r, fill }, extra || {}), parent);
+const rect = (x, y, w, h, fill, parent, extra) => mk('rect', Object.assign({ x, y, width: w, height: h, fill }, extra || {}), parent);
+const elli = (cx, cy, rx, ry, fill, parent, extra) => mk('ellipse', Object.assign({ cx, cy, rx, ry, fill }, extra || {}), parent);
+const poly = (pts, fill, parent) => path_('M' + pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' L') + ' Z', fill, parent);
+const txt = (x, y, s, fill, parent, extra) => {
+  const t = mk('text', Object.assign({ x, y, fill, 'font-family': 'Kai', 'font-size': 40 }, extra || {}), parent);
+  t.textContent = s; return t;
+};
+function tr(e, x, y, s, rot) {
+  e.setAttribute('transform', `translate(${x.toFixed(2)},${y.toFixed(2)})` +
+    (s != null ? ` scale(${s.toFixed(4)})` : '') + (rot ? ` rotate(${rot.toFixed(2)})` : ''));
+  return e;
+}
+function setOpacity(e, o) { e.setAttribute('opacity', o <= 0.001 ? 0 : Math.min(1, o).toFixed(3)); }
+
+/* ---------------- 5. 撕纸边 ---------------- */
+/**
+ * 生成一条“撕开”的纸边路径（从 (0,y) 到 (w,y)，带随机齿和毛刺）。
+ * teeth 是齿数；amp 是振幅（像素）。seed 固定则形状固定。
+ */
+function tornPath(w, h, y, amp, seed, teeth) {
+  const r = rng(seed);
+  const n = teeth || Math.max(8, Math.round(w / 90));
+  const step = w / n;
+  let d = `M0,${h + 40} L0,${(y + (r() - .5) * amp).toFixed(1)}`;
+  for (let i = 1; i <= n; i++) {
+    const x = i * step;
+    const yy = y + (r() - .5) * amp * 1.7 + Math.sin(i * 2.1 + seed) * amp * .5;
+    const cx = x - step * (.35 + r() * .3);
+    const cy = yy + (r() - .5) * amp * 2.2;
+    d += ` Q${cx.toFixed(1)},${cy.toFixed(1)} ${x.toFixed(1)},${yy.toFixed(1)}`;
+  }
+  d += ` L${w},${h + 40} Z`;
+  return d;
+}
+
+/**
+ * 竖向撕纸边：贴着纸的毛面露出一条纸芯白边。
+ * 用在第 6 镜两张纸分开的地方。
+ *
+ * 关键在于「两条边必须平行」——内缘是从外缘整体往里挪 w 得到的同一条曲线，
+ * 只有外缘才随机。早先两条边各自独立随机，宽窄乱跳，出来的是一条飘在纸外的丝带，
+ * 而不是纸被撕开的断面。等距三角更糟，会读成拉链。
+ *
+ * side: 'R' 撕口朝右（贴在左半张纸的右边缘）／'L' 撕口朝左
+ */
+/**
+ * 竖向撕口的采样点（y 从 -20 到 len-20）。
+ * 单独抽出来是为了让「纸的裁剪边」和「纸芯白边」用同一条曲线——
+ * 纸边是直的话，白边就成了悬在缝里的一条丝带，怎么调都对不上。
+ */
+function tearJag(len, seed) {
+  const r = rng(seed);
+  const n = Math.max(14, Math.round(len / 26));
+  const step = len / n;
+  const out = [];
+  let v = 0;
+  for (let i = 0; i <= n; i++) {
+    // 撕是连续的拉扯：小幅低频摆动 + 偶发一次很深的豁口。
+    // 采样点不能太密——密了就变成一条锯齿线，读不出「纸」。
+    v = v * .72 + (r() - .5) * 9;
+    out.push(v + (r() < .22 ? (r() - .5) * 26 : 0));
+  }
+  return { out, n, step, ys: out.map((_, i) => i * step - 20) };
+}
+
+function tearStrip(parent, len, seed, col, w, side) {
+  const r = rng(seed + 7);
+  const { out: jag, n, ys } = tearJag(len, seed);
+  const k = side === 'L' ? 1 : -1;            // 内缘相对外缘的朝向
+  const yss = ys.map(v => v.toFixed(1));
+  const o = jag.map(x => x.toFixed(1));
+  const in_ = jag.map(x => (x + k * w).toFixed(1));
+  const d = 'M' + o.map((x, i) => x + ',' + yss[i]).join(' L') +
+    ' L' + in_.slice().reverse().map((x, i) => x + ',' + yss[n - i]).join(' L') + ' Z';
+  const g = g_(parent);
+  /* 纸芯的白不是一条均匀的白。纤维拉断的地方亮、压实的地方暗，
+     沿长度一定是一段亮一段暗。整条等亮度铺上去，立刻读成一根发光灯管，
+     而不是「纸被撕开露出的断面」。 */
+  const mm = /rgba?\(([^)]+)\)/.exec(col);
+  const pcs = mm ? mm[1].split(',').map(x => x.trim()) : ['242', '232', '212', '0.9'];
+  const rgb = pcs.slice(0, 3).join(',');
+  const a0 = parseFloat(pcs[3] == null ? '1' : pcs[3]);
+  const fid = 'ts' + (++gid);
+  const lg = mk('linearGradient', { id: fid, x1: 0, y1: 0, x2: 0, y2: 1 }, DEFS);
+  const N = 7;
+  for (let i = 0; i < N; i++) {
+    const a = clamp(a0 * (.46 + r() * .62), 0, 1);
+    mk('stop', { offset: (i / (N - 1)).toFixed(2), 'stop-color': `rgb(${rgb})`,
+      'stop-opacity': a.toFixed(2) }, lg);
+  }
+  path_(d, `url(#${fid})`, g);
+  // 毛口的外侧压一道暗线，纸才不会像贴纸一样浮在缝上
+  path_('M' + o.map((x, i) => x + ',' + yss[i]).join(' L'), 'none', g,
+    { stroke: 'rgba(12,6,14,.42)', 'stroke-width': 2.4 });
+  // 内缘也压一道很淡的暗线：断面是往里凹的，不是一条平面
+  path_('M' + in_.map((x, i) => x + ',' + yss[i]).join(' L'), 'none', g,
+    { stroke: 'rgba(12,6,14,.20)', 'stroke-width': 1.6 });
+  return g;
+}
+
+/**
+ * 扇贝浪顶：剪纸海面的标准轮廓。
+ * 不是正弦波——正弦波是「水面」，扇贝是「纸」。
+ * 一排向上凸的圆弧，弧度带确定性抖动，控制点落在 y-A 处。
+ */
+function scallopPath(w, h, y, amp, seed, count, cap) {
+  const r = rng(seed);
+  /* A0 是「本层最高能起多高的浪」。场景里传 4~24（旧刻度），乘 6 变成像素。
+     早先乘 3.6 是错的：叠上重尾分布之后，绝大多数浪只有 A0 的两成高，
+     实际典型浪高 = 0.5 * 3.6 * amp ≈ 1.8*amp，传 4.5 就只有 8px，
+     铺在 58px 的层距上，一层海就是一马平川，只在偶尔才冒一个包。
+     纸的浪必须在层距量级上起伏，层层才会互相咬住。 */
+  const A0 = clamp(amp * 6.0, 20, 190);   // 场景里传 4~24，这里放大成真实浪高
+  const n = count || Math.max(5, Math.round(w / 165));
+
+  /* 浪不是一排半圆拱。半圆拱三点就成立：等宽、等深、左右对称——
+     三个特征凑在一起，人眼立刻判成「瓦片／鱼鳞／印花」，绝不会判成水。
+     真正的剪纸浪有三个特点，必须写进路径里：
+     ① 段宽差得远（0.4~2.6 倍），长涌和小碎浪交替；
+     ② 浪尖偏后（在段宽的 0.72 处），前坡长、后坡陡，水才有「方向」；
+     ③ 每段的基准高度自己抖，一排浪不在同一条水平线上。
+     后坡陡到接近垂直，那一笔就是浪尖翻卷的味道，也是它不像扇贝的关键。 */
+  const ws = [];
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    /* 极窄段必须禁掉（下限从 .55 提到 .78）。
+       段宽只有一个波长的一半时，浪尖到谷底的水平距离比浪高还短，
+       再圆也是尖的——几何上装不下一个圆。 */
+    const v = .78 + Math.pow(r(), 1.2) * 1.75;
+    ws.push(v); sum += v;
+  }
+
+  /* 采样必须从**画面外**起。
+     早先第一个接点钉死在 x=0，而第一个浪尖在 0.58 段宽处（十几个像素到
+     四百像素不等）；段宽一大，画面左缘就出现一段几乎水平的直线，
+     剪影边缘成了「一块平板」，一眼不是水。
+     往前多采 3%~10% 的宽度，左缘和右缘就都落在坡上，永远不是切线水平的点。 */
+  const d0 = w * (.03 + r() * .07);
+  let x = -d0;
+
+  /* 浪高必须是**成组**的，不能逐段独立取样。
+     独立取样时一道高浪紧挨一道矮浪，接缝处的切线陡到接近竖直，
+     整排立刻读成锯齿山脉——这正是上一版怎么调 amp 都还是尖的原因。
+     真海面是「涌群」：两三道大浪连着来，中间隔一段几乎平的水。
+     所以浪高由两条低频正弦叠加决定（相邻段天然相关），
+     再乘一个随机的组内系数，让同一个涌群里也有高低。 */
+  const ph1 = r() * 6.283, ph2 = r() * 6.283, ph3 = r() * 6.283;
+  const f1 = .62 + r() * .46, f2 = 1.5 + r() * 1.2;
+  const swell = i => {
+    const s = .5 + .5 * Math.sin(i * f1 + ph1);
+    const t = .5 + .5 * Math.sin(i * f2 + ph2);
+    // 0.03~1：绝大多数段落在 0.2~0.7，偶尔一整段涌起来
+    return Math.pow(s, 1.5) * (.45 + .55 * t);
+  };
+  let yy = y + Math.sin(ph3) * A0 * .10;
+  /* 先采样「谷 → 峰 → 谷」的点列，最后用 Catmull-Rom 统一过一遍。
+     逐段各拼一条三次贝塞尔的话，段与段的接头处切线不连续，
+     一排浪立刻变成锯齿山脉——因为尖是拼出来的，不是水本来的样子。
+     水的特征是「峰圆、谷圆，只有前后坡长短不同」，所以形状的差异
+     必须落在采样点位置上（浪尖偏后、段宽悬殊），而不是落在尖角上。 */
+  const P = [[x, yy]];
+  for (let i = 0; i < n; i++) {
+    const dx = (w + d0) * ws[i] / sum;
+    /* cap：浪高的上限。层叠海面每一层的间距只有 50~60px，
+       浪一起过这个数，近层就会翻到远层基线上面去，
+       读起来是「一片平原前面立着几座山」——层不再套着层。
+       默认不设限（单层巨浪不受限），seaStack 会按层距传真实上限。
+
+       必须是**软顶（tanh）**，不能是 Math.min。硬截断会把所有超过上限的
+       涌群压成同一个高度：一排浪顶齐平，浪峰变成平台，读起来是「土坡」；
+       而且被截断的那一段切线又恰好是水平的，平台两端各留一个折角。
+       tanh 只是把大的往回收、小的几乎不动：raw=上限 时收到 0.76 倍，
+       三倍上限才收到 0.995 倍——涌群的高低差被压扁，但没有一层被削平。 */
+    const raw = A0 * (.10 + swell(i) * 1.28);
+    const a = cap ? cap * Math.tanh(raw / cap) : raw;
+    P.push([x + dx * (.58 + r() * .16), yy - a]);   // 浪尖偏后：前坡长、后坡短
+    x += dx;
+    // 接点也不许逐段乱跳：基线跟着同一个涌缓缓起伏，一排浪才是一条水面
+    yy = y + Math.sin(i * .9 + ph1) * A0 * .11 + (r() - .5) * A0 * .05;
+    P.push([x, yy]);
+  }
+
+  let d = `M0,${h + 60} L${P[0][0].toFixed(1)},${P[0][1].toFixed(1)}` + smoothD(P, true);
+  d += ` L${w},${h + 60} Z`;
+  return d;
+}
+
+/**
+ * 一张纸：接触影 + 本体 + 错版白边 + 受光亮膜。
+ * 剪纸片的体积感全靠这四层，缺一层就变成色块。
+ *
+ * mode: 'sea'（默认，扇贝浪顶）| 'torn'（撕纸直边，用于幕布/信纸）
+ */
+function paperLayer(parent, opt) {
+  const o = Object.assign({ w: W, h: H, y: H * .6, amp: 14, seed: 1,
+    fill: '#12283c', shade: 'rgba(0,0,0,.42)', hi: 'rgba(255,255,255,.10)',
+    teeth: null, shadow: 11, mode: 'sea', face: null, rim: 2.4,
+    misreg: null, mdx: -4, mdy: -5, misregO: .5, cap: null }, opt);
+  const g = g_(parent, { 'data-paper': 1 });
+  const d = o.mode === 'torn'
+    ? tornPath(o.w, o.h, o.y, o.amp, o.seed, o.teeth)
+    : scallopPath(o.w, o.h, o.y, o.amp, o.seed, o.teeth, o.cap);
+  /* 接触影：不要用「同形状整体下移的实心拷贝」。
+     那样每一层都会得到一条硬邦邦的深色轮廓，配上上沿那条亮线，
+     一层纸就成了一根上下双色的灯管；四层叠起来是一排灯管。
+     真实的投影是「贴着纸边最暗，往下三十像素就没了」，
+     所以用一条竖直渐变铺在同一个形状上，形状不动、亮度自己衰减。 */
+  if (o.shadow) {
+    const A0 = clamp(o.amp * 6.0, 20, 190);
+    const sp = rgbaParts(o.shade);
+    const sid = 'sd' + (++gid);
+    const sg = mk('linearGradient', {
+      id: sid, gradientUnits: 'userSpaceOnUse',
+      x1: 0, y1: o.y - A0 * .1, x2: 0, y2: o.y + Math.max(18, o.shadow * 2.6)
+    }, DEFS);
+    mk('stop', { offset: 0, 'stop-color': `rgb(${sp.r},${sp.g},${sp.b})`,
+      'stop-opacity': sp.a.toFixed(3) }, sg);
+    mk('stop', { offset: .45, 'stop-color': `rgb(${sp.r},${sp.g},${sp.b})`,
+      'stop-opacity': (sp.a * .42).toFixed(3) }, sg);
+    mk('stop', { offset: 1, 'stop-color': `rgb(${sp.r},${sp.g},${sp.b})`,
+      'stop-opacity': 0 }, sg);
+    path_(d, `url(#${sid})`, g, { transform: `translate(0,${Math.round(o.shadow * .5)})` });
+  }
+  // 错版白边：套色没对准时露出的纸底。偏移几像素，只在受光侧透出来
+  if (o.misreg) path_(d, o.misreg, g, {
+    transform: `translate(${o.mdx},${o.mdy})`, opacity: o.misregO
+  });
+  path_(d, o.fill, g);
+  // 受光面：只贴着浪脊的一条窄亮带，往下很快消失。
+  // 早先写成整层 0.55 的亮膜，等于给每层海都糊了一层灰，四层立刻分不清远近。
+  // 渐变必须用 userSpaceOnUse 按「振幅」定位——按包围盒取百分比的话，
+  // 路径一直延伸到画面底部，26% 就成了 100px 宽的一大片暖膜。
+  if (o.face) {
+    const A0 = clamp(o.amp * 6.0, 20, 190);
+    const fid = 'fg' + (++gid);
+    const fg = mk('linearGradient', {
+      id: fid, gradientUnits: 'userSpaceOnUse',
+      x1: 0, y1: o.y - A0 * .55, x2: 0, y2: o.y + A0 * .05
+    }, DEFS);
+    mk('stop', { offset: 0, 'stop-color': o.face, 'stop-opacity': .32 }, fg);
+    mk('stop', { offset: .60, 'stop-color': o.face, 'stop-opacity': .04 }, fg);
+    mk('stop', { offset: 1, 'stop-color': o.face, 'stop-opacity': 0 }, fg);
+    path_(d, `url(#${fid})`, g);
+  }
+  if (o.rim) {
+    /* 亮膜只能贴在浪脊上。整条轮廓用同一个亮度描一遍，四层叠起来就是
+       四五条平行的亮线，整片海读成电线／心电图／栅栏，而不是纸。
+       真纸的断面是「朝光的那一小段白，往下就没了」，所以描边本身必须是
+       一条沿高度衰减的渐变：浪脊（y 小）亮，谷底（y 大）自动消失。
+       边缘于是成了「受光」，不是「被画出来」。
+       —— 上一版这里给的是纯色 rgba，四条线一交叉，九宫格里全片海面都是网。 */
+    const rimA0 = clamp(o.amp * 6.0, 20, 190);
+    const rp = rgbaParts(o.hi);
+    const rid = 'rm' + (++gid);
+    const rg = mk('linearGradient', {
+      id: rid, gradientUnits: 'userSpaceOnUse',
+      x1: 0, y1: o.y - rimA0 * 1.05, x2: 0, y2: o.y + rimA0 * .26
+    }, DEFS);
+    const aTop = clamp(rp.a * 1.15, 0, .30);
+    mk('stop', { offset: 0, 'stop-color': `rgb(${rp.r},${rp.g},${rp.b})`,
+      'stop-opacity': aTop.toFixed(3) }, rg);
+    mk('stop', { offset: .42, 'stop-color': `rgb(${rp.r},${rp.g},${rp.b})`,
+      'stop-opacity': (aTop * .34).toFixed(3) }, rg);
+    mk('stop', { offset: 1, 'stop-color': `rgb(${rp.r},${rp.g},${rp.b})`,
+      'stop-opacity': 0 }, rg);
+    path_(d, 'none', g, { stroke: `url(#${rid})`, 'stroke-width': o.rim });
+  }
+  g.__d = d;
+  return g;
+}
+
+/**
+ * 水面倒影光柱：一串被浪打碎的横纸条，越远越淡、越窄。
+ * 这是「月光落在海上」的唯一可信做法——整块反光板会立刻假掉。
+ */
+const TICK = [];
+function reflect(parent, x, y0, y1, w, col, seed) {
+  const r = rng(seed || 91);
+  const g = g_(parent, { class: 'reflect' });
+  const n = 26, sl = [];
+  for (let i = 0; i < n; i++) {
+    const p = i / (n - 1);
+    const yy = lerp(y0, y1, Math.pow(p, .82));
+    // 碎光：宽度差必须拉大。一排等宽横条会读成竹梯，而不是水面反光
+    const ww = w * (1 - p * .40) * (.28 + r() * 1.15);
+    const hh = lerp(7.5, 2.2, p) * (.60 + r() * .90);
+    const dx = (r() - .5) * w * (.42 + p * 1.5);
+    /* 顶部必须淡入。最上面那一格是整条倒影里最宽、最亮的一条，
+       它的上边缘是一条硬直线，正好横切过月亮下缘——
+       在九宫格里读成一道划痕，而不是水面。 */
+    let a0 = lerp(.44, .03, p) * (.45 + r() * .55) * Math.min(1, .10 + p * 5.0);
+    if (p > .2 && r() < .16) a0 *= .22;           // 偶尔断一下，光路才不假
+    const e = rect(x - ww / 2 + dx, yy, ww, hh, col, g,
+      { rx: hh / 2, opacity: a0.toFixed(3) });
+    sl.push({ e, a0, ww, hh, cx: x + dx, yy });
+  }
+  TICK.push(t => {
+    const ph = beatPos(t) * Math.PI;
+    for (let i = 0; i < sl.length; i++) {
+      const s = sl[i];
+      const k = .58 + .42 * Math.pow(.5 + .5 * Math.sin(ph + i * .72), 2);
+      setOpacity(s.e, s.a0 * k);
+      const wf = (0.82 + 0.18 * Math.sin(ph * .5 + i * 1.31)).toFixed(3);
+      s.e.setAttribute('width', (s.ww * wf).toFixed(1));
+      s.e.setAttribute('x', (s.cx - s.ww * wf / 2).toFixed(1));
+    }
+  });
+  TICK[TICK.length - 1](0);
+  return g;
+}
+
+/**
+ * 前景压边浪：贴着画面底边的一条深色浪，几乎不参与叙事，只负责景深。
+ * 有了它，中景的船才有「在远处」的感觉。
+ */
+function nearWave(parent, y, col, seed, hi) {
+  return paperLayer(parent, {
+    // amp 别给大：26 会变成 130px 高的拱，画面底下就成了一排石拱桥
+    y, amp: 12, seed, teeth: 10, fill: col, shadow: 26,
+    hi: hi || 'rgba(255,255,255,.16)', rim: 3.4,
+    shade: 'rgba(0,0,0,.55)'
+  });
+}
+
+/**
+ * 立起来的巨浪：一张被卷起来的纸。
+ *
+ * 让浪「立住」的不是振幅，是那个**钩**：
+ * 浪脊向右前方探出去、再垂下来，形成一段悬垂的浪唇，唇下留一道暗缝。
+ * 只要轮廓是左右对称的大三角，不管多高，眼睛一律判成山——
+ * 山和浪的全部区别就在「唇有没有往回转」。
+ *
+ * @param x  浪脚左端；@param yb 基线；@param w 总宽；@param h 浪高
+ */
+function heroWave(parent, x, yb, w, h, col, opt) {
+  const o = Object.assign({ seed: 611, foam: '#f8f0dd', deep: 'rgba(5,9,18,.66)' }, opt);
+  const g = g_(parent, { class: 'hero' });
+  const F = v => v.toFixed(1);
+  const px = u => x + w * u, py = v => yb - h * v;   // u/w 与 v/h 的换算
+
+  /* 本体：一坨不对称的涌，**左缓右陡**。
+     上一版的后坡和前脸坡度接近、顶又宽又圆，那就是一座山的全部特征。
+     山是「宽肩 + 对称坡」，浪是「长后坡 + 一道近乎垂直的前脸」。 */
+  const body = `M${F(px(-.14))},${F(yb)} ` +
+    `C${F(px(-.05))},${F(py(.05))} ${F(px(.02))},${F(py(.34))} ${F(px(.155))},${F(py(.62))} ` +
+    `C${F(px(.255))},${F(py(.83))} ${F(px(.345))},${F(py(.965))} ${F(px(.42))},${F(py(.97))} ` +
+    `C${F(px(.465))},${F(py(.90))} ${F(px(.505))},${F(py(.60))} ${F(px(.515))},${F(py(.30))} ` +
+    `C${F(px(.525))},${F(py(.14))} ${F(px(.56))},${F(py(.03))} ${F(px(.62))},${F(yb + 6)} ` +
+    `L${F(px(-.10))},${F(yb + 6)} Z`;
+  /* 底边只到水面就闭合，**不许往画面下沿延伸**。
+     早先这里是 `L px(1.18), yb+h*.55`——把下半屏整个填满，
+     于是这块深蓝从画框左边缘一路长到右边缘、从底部长到顶：
+     那是山的画法（山有地面），浪的画法是「水面之上鼓起一团」，
+     浪脚以下的横向层次必须露出来，眼睛才认得出那是水。 */
+
+  // 接触影
+  const sid = 'hs' + (++gid);
+  const sg = mk('linearGradient', { id: sid, gradientUnits: 'userSpaceOnUse',
+    x1: 0, y1: py(.02), x2: 0, y2: yb + h * .30 }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': 'rgb(4,10,20)', 'stop-opacity': .52 }, sg);
+  mk('stop', { offset: 1, 'stop-color': 'rgb(4,10,20)', 'stop-opacity': 0 }, sg);
+  path_(body, `url(#${sid})`, g, { transform: 'translate(0,14)' });
+  // 错版白边
+  path_(body, o.foam, g, { transform: 'translate(-4,-5)', opacity: .18 });
+  /* 本体受光：**斜向**——浪背朝天那面亮，前脸背光那面暗。
+     早先写成纯竖直（上亮下暗），那是山体的打光模型：
+     山只有一个顶，光从上面均匀压下来；浪有一个转折，
+     浪背和浪壁是两个朝向完全不同的面，必须给出明度差。 */
+  const bid = 'hb' + (++gid);
+  const bg = mk('linearGradient', { id: bid, gradientUnits: 'userSpaceOnUse',
+    x1: px(.10), y1: py(.92), x2: px(.62), y2: py(.06) }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': mixHex(col, '#ffffff', .34) }, bg);
+  mk('stop', { offset: .48, 'stop-color': col }, bg);
+  mk('stop', { offset: 1, 'stop-color': mixHex(col, '#05070e', .50) }, bg);
+  path_(body, `url(#${bid})`, g);
+
+  /* 浪壁白口：沿前脸往下淌的几道弧线。
+     这是「水」最便宜的签名——山体上不会有从脊线往下流的白线。
+     单帧静态画里，形状只能说明「这儿有个高东西」，
+     是这几道往下走的白口把它判成浪。 */
+  const rf = rng(o.seed + 77);
+  for (let i = 0; i < 4; i++) {
+    const u0 = .445 + i * .034;
+    const v0 = .90 - i * .022;
+    const dep = .34 + rf() * .40;
+    const d = `M${F(px(u0))},${F(py(v0))} ` +
+      `Q${F(px(u0 + .052))},${F(py(v0 - dep * .58))} ${F(px(u0 + .038))},${F(py(v0 - dep))}`;
+    path_(d, 'none', g, { stroke: o.foam, 'stroke-width': 2.6 + rf() * 3.2,
+      'stroke-linecap': 'round', opacity: .16 + rf() * .20 });
+  }
+
+  /* 浪唇：一段独立的月牙纸，从浪脊探出去、翻卷、唇尖再往回勾一点。
+     这是全片唯一真正「卷」起来的东西——它必须是单独一张纸，
+     因为纸的翻卷靠的是「这一张压在那一张上面 + 它自己的投影」，
+     在同一个轮廓里画个弯，只会得到一块带缺口的板。
+
+     三个必须写进轮廓的形状条件（上一版没写，渲出来是一片「刀鳍」）：
+     ① 唇根要有厚度：上沿压在浪脊上、下沿扎进浪的前脸，两头**不许**收成一个点；
+     ② 唇尖必须往回勾、朝下，指着浪面；朝外伸出去停在半空就是一把刀；
+     ③ 下沿（我们看到的唇腹）要比上沿更往左收，唇才有弯下去的体积。 */
+  const B  = [px(.42), py(.95)];   // 唇根·上沿起点（埋在浪脊里）
+  const B2 = [px(.495), py(.74)];  // 唇根·下沿起点（扎在浪的前脸上）
+  const M  = [px(.665), py(.66)];  // 唇背最外
+  const T  = [px(.60), py(.40)];   // 唇尖：落到唇背下方、略微回勾
+  const lipTop = `M${F(B[0])},${F(B[1])} ` +
+    `C${F(px(.50))},${F(py(1.03))} ${F(px(.615))},${F(py(.97))} ${F(M[0])},${F(M[1])} ` +
+    `C${F(px(.715))},${F(py(.575))} ${F(px(.655))},${F(py(.425))} ${F(T[0])},${F(T[1])}`;
+  const lipBot = ` C${F(px(.575))},${F(py(.50))} ${F(px(.52))},${F(py(.63))} ${F(B2[0])},${F(B2[1])}` +
+    ` C${F(px(.472))},${F(py(.845))} ${F(px(.445))},${F(py(.925))} ${F(B[0])},${F(B[1])} Z`;
+  const lip = lipTop + lipBot;
+
+  /* 唇的投影：形状照抄唇、往下错开，但用一条竖直渐变把下半截化掉。
+     纯色拷贝会在浪面上留一条硬边，读成「又一张纸」而不是影子。 */
+  const kid2 = 'hk' + (++gid);
+  const kg = mk('linearGradient', { id: kid2, gradientUnits: 'userSpaceOnUse',
+    x1: 0, y1: py(.72), x2: 0, y2: py(.16) }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': 'rgb(4,9,18)', 'stop-opacity': .72 }, kg);
+  mk('stop', { offset: .5, 'stop-color': 'rgb(4,9,18)', 'stop-opacity': .30 }, kg);
+  mk('stop', { offset: 1, 'stop-color': 'rgb(4,9,18)', 'stop-opacity': 0 }, kg);
+  path_(lip, `url(#${kid2})`, g, { transform: 'translate(12,30)' });
+
+  // 纸的厚度：同一轮廓往下错几像素，暗一档，只从左下沿露出一条窄边
+  path_(lip, mixHex(col, '#05070e', .58), g, { transform: 'translate(4,10)' });
+
+  /* 唇面受光：必须**沿着唇的走向**渐变（唇根亮 → 唇尖暗），
+     因为唇是卷下去的，越卷越背光。
+     早先写成竖直向渐变、而且上下搞反了：唇背上沿是暗的、下沿是亮的，
+     亮口再一勾，整片唇读成一把刀刃。 */
+  const lid = 'hl' + (++gid);
+  const lg = mk('linearGradient', { id: lid, gradientUnits: 'userSpaceOnUse',
+    x1: B[0], y1: B[1], x2: T[0], y2: T[1] }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': mixHex(col, '#ffffff', .62) }, lg);
+  mk('stop', { offset: .46, 'stop-color': mixHex(col, '#ffffff', .46) }, lg);
+  mk('stop', { offset: 1, 'stop-color': mixHex(col, '#ffffff', .16) }, lg);
+  path_(lip, `url(#${lid})`, g);
+
+  /* 唇边白口：剪纸里翻卷的唇边是「纸的断口」，
+     一条贴着唇上沿的亮口就够——沿整圈描一遍会变成勾线；
+     而且必须到唇尖就熄灭，亮到尖上就成了刀锋。 */
+  const fid = 'hf' + (++gid);
+  const fg2 = mk('linearGradient', { id: fid, gradientUnits: 'userSpaceOnUse',
+    x1: B[0], y1: B[1], x2: T[0], y2: T[1] }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': o.foam, 'stop-opacity': .22 }, fg2);
+  mk('stop', { offset: .30, 'stop-color': o.foam, 'stop-opacity': .88 }, fg2);
+  mk('stop', { offset: .72, 'stop-color': o.foam, 'stop-opacity': .34 }, fg2);
+  mk('stop', { offset: 1, 'stop-color': o.foam, 'stop-opacity': 0 }, fg2);
+  path_(lipTop, 'none', g, { stroke: `url(#${fid})`, 'stroke-width': 5.5, 'stroke-linecap': 'round' });
+
+  /* 浪花：只从唇尖甩出去的一小簇。
+     早先 10 粒沿一条斜线等距排开，读成一串珍珠项链。
+     碎浪是「一簇」——大小悬殊、挤在尖上一团，只有几粒飞远。 */
+  const r = rng(o.seed);
+  for (let i = 0; i < 9; i++) {
+    const far = i > 5;
+    const t = far ? (i - 5) / 3 : r();
+    const qx = T[0] + w * (far ? .02 + t * .085 : (.004 + r() * .028)) + (r() - .5) * w * .022;
+    const qy = T[1] + h * (far ? .01 + t * .05 : (r() - .62) * .075) + (r() - .5) * h * .03;
+    circ(qx, qy, 1.8 + Math.pow(r(), 2.8) * (far ? 7 : 9.5), o.foam, g,
+      { opacity: .22 + r() * .50 });
+  }
+  g.__shape = body;
+  /* 浪脊坐标随图元一起交出去。上层镜头（船停哪儿、往哪儿飞）直接读这个，
+     不要再在外面乘一遍 .34/.60 之类的比例——那份比例是死的，改形状就失效。 */
+  g.__crest = { x: px(.42), y: py(.97) };
+  return g;
+}
+
+/**
+ * 卷浪（第二方案）：**三条弧带叠起来**，不是一坨实心浪体。
+ *
+ * `heroWave` 画的是「一个东西的侧影」——那是石头的画法。
+ * 一个实心的、有完整外轮廓的深色团块，只要高宽比接近 1，
+ * 不管加多少泡沫、改多少次斜度，眼睛一律判成山（连着七轮都是这个结果）。
+ *
+ * 纸艺里的浪是「水面被卷成一条带子」：每一层都是一张**独立的月牙纸**，
+ * 下缘敞开、能看见下面那一层，最上面一层翻过来成为唇。
+ * 层与层之间留着看得见的缝，这件东西就只能是水——石头没有缝。
+ */
+function curlWave(parent, x, yb, w, h, col, opt) {
+  const o = Object.assign({ seed: 621, foam: '#f8f0dd', steps: 2 }, opt);
+  const g = g_(parent, { class: 'curl' });
+  const F = v => v.toFixed(1);
+  const px = u => x + w * u, py = v => yb - h * v;
+  const r = rng(o.seed);
+  const bands = [];
+
+  for (let k = 0; k < o.steps; k++) {
+    const f = k / Math.max(1, o.steps - 1);        // 0 = 外层体量，1 = 最内那条浪舌
+    const isLip = k === o.steps - 1;
+    /* 每层比外层小一圈、低一截、往前挪一点 —— 这才叫「层叠」；
+       把同一个形状缩三次放上去，那是印花。 */
+    const L = px(-.26 + f * .40 + (r() - .5) * .035);
+    const R = px(isLip ? .70 : .86 + (r() - .5) * .035);
+    const apex = px(.50 + f * .075 + (r() - .5) * .045);
+    const ay = py(1 - f * .28 + (r() - .5) * .035);
+    /* 浪舌那一层**不落回水面**：右端悬空收住，那一头就是舌头。
+       两层都老老实实扎进水里，读出来是两道拱——拱是没有方向的，
+       悬空的那一头才有「往这边卷」的方向。 */
+    const Ry = isLip ? py(.18) : yb;
+    /* 厚度必须**非线性**：外层是浪的体量（厚），内层那条舌头也要有肉，
+       否则它只是一根细弧线，挂在洞里像把手。 */
+    const th = h * (isLip ? .60 : .86);
+    const foot = h * .10;                          // 浪脚插进水里的深度
+    const q1 = [apex, 2 * ay - Ry];                // 外弧控制点（令曲线穿过弧顶）
+    const q2 = [apex, 2 * (ay + th) - yb];         // 内弧控制点
+    const shell = `M${F(L)},${F(yb + foot)} L${F(L)},${F(yb)} ` +
+      `Q${F(q1[0])},${F(q1[1])} ${F(R)},${F(Ry)} ` +
+      (isLip ? `L${F(R + w * .012)},${F(Ry + th * .86)} ` : `L${F(R)},${F(yb + foot)} `) +
+      `Q${F(q2[0])},${F(q2[1])} ${F(L)},${F(yb + foot)} Z`;
+
+    // 投影：整条带子往下错开，压在它下面那一层上
+    path_(shell, 'rgba(4,10,20,.44)', g, { transform: 'translate(0,20)' });
+    // 错版白边：剪纸的套色误差
+    path_(shell, o.foam, g, { transform: 'translate(-5,-6)', opacity: .15 });
+
+    /* 带子本体：一张薄纸，上沿受光、下沿背光。
+       这里用**竖直**渐变反而是对的——因为画的是一条薄带，不是一座山。 */
+    const id = 'cw' + (++gid);
+    const lg = mk('linearGradient', { id, gradientUnits: 'userSpaceOnUse',
+      x1: 0, y1: ay, x2: 0, y2: ay + th }, DEFS);
+    const base = mixHex(col, '#ffffff', .06 + f * .16);
+    mk('stop', { offset: 0, 'stop-color': mixHex(base, '#ffffff', .38) }, lg);
+    mk('stop', { offset: .52, 'stop-color': base }, lg);
+    mk('stop', { offset: 1, 'stop-color': mixHex(base, '#05070e', .42) }, lg);
+    path_(shell, `url(#${id})`, g);
+
+    // 上沿亮口：纸被卷起来时露出的断口
+    path_(`M${F(L)},${F(yb)} Q${F(q1[0])},${F(q1[1])} ${F(R)},${F(Ry)}`, 'none', g,
+      { stroke: o.foam, 'stroke-width': 4.2 - k * 1.4, 'stroke-linecap': 'round',
+        opacity: .34 + f * .30 });
+
+    bands.push({ L, R, apex, ay, th });
+  }
+
+  g.__bands = bands;
+  const top = bands[bands.length - 1];
+  g.__crest = { x: top.apex, y: top.ay };
+  return g;
+}
+/* ---------------- 6. 图形母题库 ---------------- */
+/* 每个母题只画“型”，不带时间；时间由场景 update() 从外部驱动。 */
+
+/** 径向光晕：只有渐变能做出「光从纸背后透出来」，平铺同心圆会露出硬边 */
+function radialGlow(parent, x, y, r, col, a, mid) {
+  const id = 'rg' + (++gid);
+  const rg = mk('radialGradient', { id }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': col, 'stop-opacity': (a).toFixed(3) }, rg);
+  mk('stop', { offset: mid || .45, 'stop-color': col, 'stop-opacity': (a * .42).toFixed(3) }, rg);
+  mk('stop', { offset: .74, 'stop-color': col, 'stop-opacity': (a * .12).toFixed(3) }, rg);
+  mk('stop', { offset: 1, 'stop-color': col, 'stop-opacity': 0 }, rg);
+  return circ(x, y, r, `url(#${id})`, parent);
+}
+
+/**
+ * 把一串采样点连成 C1 连续的三次贝塞尔（Catmull-Rom 转 Bezier）。
+ * 波浪、云、山脊都靠它——逐段各自拼弧线，接头处切线不连续，
+ * 出来一定是锯齿；而「圆峰圆谷」正是水与云区别于山的地方。
+ * 形状的差异要落在采样点位置上，不要落在尖角上。
+ */
+function smoothD(P, noLead) {
+  const n = P.length;
+  /* 切线必须是「局部极值处水平」。
+     标准 Catmull-Rom 的切线取 (p2-p0)/6：浪尖前后两点一高一低时，
+     这个切线是斜的——曲线在最高点被拉出一个折角，浪尖就成了尖三角，
+     一排浪立刻读成锯齿山。这不是振幅问题，是把峰当成了拐点。
+     每个点先判是不是 y 方向的局部极值（峰/谷），是就把切线压平，
+     峰于是变成圆的——水的特征就是峰圆谷圆，只有前后坡长短不同。 */
+  const tan = [];
+  for (let i = 0; i < n; i++) {
+    const a = P[Math.max(0, i - 1)], b = P[i], c = P[Math.min(n - 1, i + 1)];
+    let mx = (c[0] - a[0]) / 6, my = (c[1] - a[1]) / 6;
+    const isExt = (b[1] <= a[1] && b[1] <= c[1]) || (b[1] >= a[1] && b[1] >= c[1]);
+    if (isExt) my = 0;
+    tan.push([mx, my]);
+  }
+  let d = noLead ? '' : `M${P[0][0].toFixed(1)},${P[0][1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const p1 = P[i], p2 = P[i + 1], t1 = tan[i], t2 = tan[i + 1];
+    d += ` C${(p1[0] + t1[0]).toFixed(1)},${(p1[1] + t1[1]).toFixed(1)} ` +
+      `${(p2[0] - t2[0]).toFixed(1)},${(p2[1] - t2[1]).toFixed(1)} ` +
+      `${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+  }
+  return d;
+}
+
+/**
+ * 剪纸刀痕：一块不规则的闭合纸片路径。
+ * 月海、洞、斑、云团都用它——椭圆一眼就是「贴纸」，不规则才像剪出来的。
+ * jag 是半径抖动幅度（0.3 = ±15%）。
+ */
+function cutBlob(cx, cy, rad, seed, pts, jag) {
+  const r = rng(seed || 11);
+  const n = pts || 9;
+  const P = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2;
+    const q = rad * (1 + (r() - .5) * (jag == null ? .34 : jag));
+    P.push([cx + Math.cos(a) * q, cy + Math.sin(a) * q * .84]);
+  }
+  const mid = (p, q) => [((p[0] + q[0]) / 2).toFixed(1), ((p[1] + q[1]) / 2).toFixed(1)];
+  let d = 'M' + mid(P[n - 1], P[0]).join(',');
+  for (let i = 0; i < n; i++) {
+    d += ` Q${P[i][0].toFixed(1)},${P[i][1].toFixed(1)} ${mid(P[i], P[(i + 1) % n]).join(',')}`;
+  }
+  return d + ' Z';
+}
+
+/** 月亮：一张剪下来的纸月亮，不是发光的球。
+ *
+ *  早先是一个 radial-gradient 圆盘 —— 九帧里有七帧都有它，读起来像「灯泡」。
+ *  剪纸月亮的可信度全在这几笔上：
+ *  ① 错版白边：整张往左上偏 3~4px 露出的纸底（最容易认、也最常被漏掉）；
+ *  ② 纸面：上亮下暗的实心渐变，不是中心亮四周暗；
+ *  ③ 纸厚：下沿一圈暗边，月亮才有被「割下来贴上去」的实体感；
+ *  ④ 月海：3~5 块大小悬殊的不规则刀痕，透明度极低，只在侧面看得出；
+ *  ⑤ 两三个小陨石坑，带亮口——坑是剪出来的洞，洞是有边的。
+ */
+function moon(parent, x, y, r, col, opt) {
+  const o = Object.assign({ glow: 1, seed: 41 }, opt);
+  const g = g_(parent, { class: 'moon' });
+  const rr = rng(o.seed);
+
+  radialGlow(g, 0, 0, r * 3.4, col, .20 * o.glow, .38);
+  radialGlow(g, 0, 0, r * 1.62, col, .22 * o.glow, .52);
+
+  // ① 错版白边
+  circ(-r * .035, -r * .045, r, '#fbf1da', g, { opacity: .30 });
+  // ② 纸面（上亮下暗）
+  circ(0, 0, r, grad('#fffef8', col, true), g, { opacity: .99 });
+  // ③ 下沿纸厚
+  path_(`M${-r},0 A${r},${r} 0 0 0 ${r},0`, 'none', g,
+    { stroke: 'rgba(74,52,84,.20)', 'stroke-width': Math.max(2.2, r * .055) });
+
+  // ④ 月海：一大两小，位置拉开。大小悬殊是重点——
+  //    两块差不多大的斑并排落在中间，人眼会读成一张脸的眼睛。
+  //    透明度必须压到「侧头才看得见」：0.09 的灰块压在奶白上，
+  //    边缘是硬的，读出来是霉斑／虫蛀，不是月海。
+  path_(cutBlob(-r * .28, -r * .30, r * .46, o.seed + 1, 12, .34),
+    'rgba(104,96,112,.050)', g);
+  path_(cutBlob(r * .30, r * .36, r * .26, o.seed + 2, 10, .42),
+    'rgba(104,96,112,.042)', g);
+  path_(cutBlob(-r * .12, r * .60, r * .16, o.seed + 3, 9, .46),
+    'rgba(104,96,112,.034)', g);
+
+  // ⑤ 陨石坑：暗口 + 亮底，像剪了个洞，光从洞里透出来
+  for (let i = 0; i < 3; i++) {
+    const a = rr() * Math.PI * 2;
+    const rd = r * (.24 + rr() * .34);
+    const cx = Math.cos(a) * rd, cy = Math.sin(a) * rd * .9;
+    const cr = r * (.030 + rr() * .038);
+    circ(cx, cy + cr * .5, cr, 'rgba(255,255,255,.26)', g);
+    circ(cx, cy, cr, 'rgba(96,88,106,.075)', g);
+  }
+
+  tr(g, x, y, 1);
+  return g;
+}
+
+/** 云：一条被光从背面打亮的纸云带。
+ *
+ *  早先的写法是「折线拼出来的梯形起伏」，本意是「剪纸的硬角多边形」，
+ *  但折线在峰顶是尖的，一朵云就成了一顶纸皇冠／一排锯齿。剪纸云的硬
+ *  不等于尖——它是「一圈软圆弧 + 一条平底」，硬的是剪口，不是峰。
+ *  所以这里仍然是采样点 + smoothD，但点的分布改成「团块」：
+ *  叶宽悬殊（一个大的带两三个小的）、峰高跟着叶宽走、谷不落到基线以下。
+ */
+function cloud(parent, x, y, s, col, seed, opt) {
+  const o = Object.assign({ misreg: null, face: null, shadow: 0 }, opt || {});
+  const r = rng(seed || 7);
+  const g = g_(parent, { class: 'cloud' });
+  const n = 2 + Math.floor(r() * 3);
+  /* 云是「一条扁带」，不是「一列山头」。两个比例决定成败：
+     ① 高宽比：整条云的高度只有它宽度的一成半到两成半；
+     ② 谷的深度：谷只落到峰高的五到七成——谷落到基线，就成了山峰。
+     早先峰高 = 叶宽 × 0.4~0.74、谷几乎贴底，一朵云读成了一排尖山。 */
+  const halfW = 150 + r() * 90;
+  const ws = [];
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const v = .70 + r() * .62; ws.push(v); sum += v; }
+  const P = [[-halfW, 0]];
+  let px = -halfW;
+  for (let i = 0; i < n; i++) {
+    const w = 2 * halfW * ws[i] / sum;
+    const h = w * (.26 + r() * .16);
+    P.push([px + w * .46, -h]);
+    px += w;
+    P.push([px, i === n - 1 ? -h * .18 : -h * (.52 + r() * .20)]);
+  }
+
+  // 底边中间微微下坠：云的底不是一条尺子画出来的直线，
+  // 而且直线底一加投影，云下面就多出一条横杠，像道划痕。
+  const d = smoothD(P) + ` L${halfW.toFixed(1)},7 Q0,17 ${(-halfW).toFixed(1)},7 Z`;
+
+  // 云很薄，投影一旦浓就成了一条黑杠横在云底下。压到 .17、位移收到 6px 以内
+  if (o.shadow) path_(d, 'rgba(6,4,12,.17)', g, { transform: `translate(0,${Math.min(o.shadow, 6)})` });
+  if (o.misreg) path_(d, o.misreg, g, { transform: 'translate(-5,-6)', opacity: .22 });
+  path_(d, col, g);
+  if (o.face) path_(d, o.face, g, { opacity: .14 });
+  // 上沿一道纸厚亮口：云才不是一块纯色
+  path_(d, 'none', g, { stroke: 'rgba(255,244,220,.13)', 'stroke-width': 2 });
+  tr(g, x, y, s);
+  return g;
+}
+
+/** 星：半拍眨一次由场景控制 opacity */
+function stars(parent, n, seed) {
+  const r = rng(seed || 21);
+  const g = g_(parent, { class: 'stars' });
+  const list = [];
+  for (let i = 0; i < n; i++) {
+    const x = r() * W, y = r() * H * .62;
+    const rr = .9 + r() * 2.1;
+    const c = circ(x, y, rr, '#fdf6e3', g, { opacity: .35 + r() * .5 });
+    list.push(c);
+  }
+  g.__stars = list;
+  return g;
+}
+
+/** 纸船：船体梯形 + 三角帆 + 桅杆 */
+function boat(parent, x, y, s, opt) {
+  const o = Object.assign({ hull: '#e9dcc0', sail: '#f7efdb', ink: '#2a3a4c' }, opt || {});
+  const g = g_(parent, { class: 'boat' });
+  path_(`M-64,0 L64,0 L44,30 L-44,30 Z`, o.hull, g);
+  path_(`M-64,0 L64,0 L58,7 L-58,7 Z`, 'rgba(0,0,0,.13)', g);
+  path_(`M-2,-96 L-2,-6 L46,-6 Z`, o.sail, g);
+  path_(`M-8,-84 L-8,-6 L-46,-6 Z`, o.sail, g, { opacity: .78 });
+  rect(-3, -100, 3, 96, o.ink, g, { opacity: .55 });
+  tr(g, x, y, s);
+  return g;
+}
+
+/** 主角小男孩：比例写死，全片不许变 */
+const KID = { hr: 21, headY: -62, bodyW: 25, bodyH: 44, eyeDX: 7.2, eyeR: 2.1 };
+function kid(parent, x, y, s, opt) {
+  const o = Object.assign({ body: '#2b3d52', skin: '#f2d6b4', hair: '#1d2530',
+    lantern: true, glow: false }, opt || {});
+  const g = g_(parent, { class: 'kid' });
+  path_(`M${-KID.bodyW},2 Q${-KID.bodyW},${2 - KID.bodyH} 0,${2 - KID.bodyH} Q${KID.bodyW},${2 - KID.bodyH} ${KID.bodyW},2 Z`, o.body, g);
+  // 灯笼先画（在身后）
+  if (o.lantern) {
+    const lg = g_(g, { transform: 'translate(31,-26)' });
+    if (o.glow) circ(0, 12, 62, '#f7c96a', lg, { opacity: .12 });
+    if (o.glow) circ(0, 12, 34, '#f7c96a', lg, { opacity: .16 });
+    mk('path', { d: 'M0,-12 L0,4', stroke: '#7a6547', 'stroke-width': 2, fill: 'none' }, lg);
+    rect(-9, 4, 18, 22, '#f0b455', lg, { rx: 6 });
+    rect(-9, 4, 18, 22, 'none', lg, { rx: 6, stroke: 'rgba(120,60,0,.35)', 'stroke-width': 1.6 });
+    rect(-5, 10, 10, 11, '#ffdf9e', lg, { rx: 3, opacity: .85 });
+  }
+  circ(0, KID.headY, KID.hr, o.skin, g);
+  // 发：一片盖住额头的纸
+  path_(`M${-KID.hr - 1},${KID.headY - 4} Q${-KID.hr},${KID.headY - KID.hr - 5} 0,${KID.headY - KID.hr - 5}
+        Q${KID.hr},${KID.headY - KID.hr - 5} ${KID.hr + 1},${KID.headY - 4}
+        Q${KID.hr * .4},${KID.headY - 12} 0,${KID.headY - 11} Q${-KID.hr * .5},${KID.headY - 12} ${-KID.hr - 1},${KID.headY - 4} Z`, o.hair, g);
+  circ(-KID.eyeDX, KID.headY + 1, KID.eyeR, '#22303f', g);
+  circ(KID.eyeDX, KID.headY + 1, KID.eyeR, '#22303f', g);
+  circ(-KID.eyeDX + 1.4, KID.headY - .6, KID.eyeR * .45, 'rgba(255,255,255,.8)', g);
+  circ(KID.eyeDX + 1.4, KID.headY - .6, KID.eyeR * .45, 'rgba(255,255,255,.8)', g);
+  tr(g, x, y, s);
+  return g;
+}
+
+/** 纸鲸：一跃而起的那一下，全片最贵的一个母题 */
+function whale(parent, x, y, s, col) {
+  const g = g_(parent, { class: 'whale' });
+  path_(`M-92,0 C-72,-44 20,-58 62,-30 C86,-14 84,10 60,20 C22,36 -60,34 -92,0 Z`, col, g);
+  path_(`M-92,0 C-112,-16 -136,-34 -150,-40 C-146,-14 -132,6 -104,16 Z`, col, g);
+  path_(`M-6,10 C10,26 28,32 40,30 C30,16 14,8 -6,10 Z`, col, g);
+  path_(`M10,-34 C22,-52 40,-56 52,-50 C40,-42 30,-36 10,-34 Z`, col, g, { opacity: .9 });
+  circ(44, -10, 3.2, '#0d1a26', g);
+  path_(`M-40,-24 q40,-8 78,4`, 'none', g, { stroke: 'rgba(255,255,255,.18)', 'stroke-width': 3 });
+  // 喷水
+  path_(`M8,-52 q6,-26 16,-34 M8,-52 q-8,-24 -18,-30`, 'none', g,
+    { stroke: 'rgba(255,255,255,.55)', 'stroke-width': 4, 'stroke-linecap': 'round' });
+  tr(g, x, y, s);
+  return g;
+}
+
+/**
+ * 孔明灯：上窄下宽的一只纸灯。
+ * 早先是个梯形方块加一条亮条，读不出「天灯」——缺三样东西：
+ * 腰要鼓（纸被热气撑起来）、光要从底下的口沿透出来、纸必须是上暗下亮的。
+ */
+function skyLantern(parent, x, y, s, seed) {
+  const r = rng(seed || 3);
+  const g = g_(parent, { class: 'sl' });
+
+  // 纸是透光的，灯外面一定裹着一团暖雾；没有这层，灯就是贴在夜空上的色块
+  radialGlow(g, 0, -2, 100, '#ffc478', .24, .5);
+  radialGlow(g, 0, 0, 46, '#ffe2ac', .32, .5);
+
+  const body = 'M-11,-32 C-15,-20 -17,-4 -17,24 L17,24 C17,-4 15,-20 11,-32 Z';
+  // 错版纸边：剪纸里最容易漏、又最像纸的一笔
+  path_(body, '#f0b878', g, { transform: 'translate(2.5,2.5)', opacity: .28 });
+  path_(body, grad('#e8a457', '#ffd691', true), g);
+
+  // 火在底下：口沿最亮，往上很快暗下去，纸的「透」才成立
+  const fid = 'lan' + (++gid);
+  const fg = mk('linearGradient', { id: fid, x1: 0, y1: 1, x2: 0, y2: 0 }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': '#fff6d8', 'stop-opacity': .88 }, fg);
+  mk('stop', { offset: .36, 'stop-color': '#ffd387', 'stop-opacity': .30 }, fg);
+  mk('stop', { offset: 1, 'stop-color': '#c8802f', 'stop-opacity': 0 }, fg);
+  path_(body, `url(#${fid})`, g);
+
+  // 竹骨：细到几乎看不见，但没有它们就是一整块色
+  [-1, 0, 1].forEach((k, i) => {
+    const xx = k * 9 * (1 - Math.abs(k) * .18);
+    path_(`M${(xx*.92).toFixed(1)},-30 C${(xx*1.10).toFixed(1)},-12 ` +
+      `${(xx*1.14).toFixed(1)},4 ${(xx*1.02).toFixed(1)},23`,
+      'none', g, { stroke: 'rgba(120,58,20,.24)', 'stroke-width': 1.1 });
+  });
+
+  // 口沿：底下那个真正的开口，火光从这里漏出来
+  const eo = mk('ellipse', { cx: 0, cy: 24, rx: 17, ry: 5.2, fill: 'rgba(92,42,12,.72)' }, g);
+  const ei = mk('ellipse', { cx: 0, cy: 24.4, rx: 14.2, ry: 3.6, fill: '#fff7dd' }, g);
+  setOpacity(ei, .95);
+
+  // 灯芯 + 拖尾的几点火星纸屑
+  circ(0, 19, 2.8, '#fffbe8', g, { opacity: .95 });
+  for (let i = 0; i < 4; i++) {
+    circ((r() - .5) * 13, 31 + i * 6.5 + r() * 3, 1.3 + r() * 1.3,
+      '#ffcf7e', g, { opacity: .46 - i * .09 });
+  }
+  tr(g, x, y, s, (r() - .5) * 6);
+  return g;
+}
+
+/** 码头：一排木板，透视靠宽度递减 */
+function dock(parent, x, y, w, col) {
+  const g = g_(parent, { class: 'dock' });
+  const n = 14;
+  for (let i = 0; i < n; i++) {
+    const t = i / n;
+    const yy = y + Math.pow(t, 1.5) * 150;
+    const ww = w * (1 - t * .18);
+    rect(x - ww / 2, yy, ww, 20 - t * 4, i % 2 ? col : 'rgba(255,255,255,.045)', g);
+  }
+  rect(x - 6, y - 96, 10, 100, 'rgba(0,0,0,.22)', g);
+  return g;
+}
+
+/** 念想泡泡：一圈虚线纸边 + 里面一个剪影 */
+function bubble(parent, x, y, r, col, innerCol) {
+  const g = g_(parent, { class: 'bub' });
+  circ(0, 0, r, 'rgba(255,255,255,.06)', g);
+  circ(0, 0, r, 'none', g, { stroke: col, 'stroke-width': 4, 'stroke-dasharray': '14 10', opacity: .8 });
+  // 里面的她：头 + 肩，纯剪影
+  circ(0, -r * .18, r * .26, innerCol, g);
+  path_(`M${-r * .56},${r * .62} Q${-r * .56},${r * .02} 0,${r * .02} Q${r * .56},${r * .02} ${r * .56},${r * .62} Z`, innerCol, g);
+  // 尾巴
+  path_(`M${-r * .3},${r * .02} L${-r * .45},${r * .74} L${-r * .1},${r * .2} Z`, 'rgba(255,255,255,.06)', g);
+  tr(g, x, y, 1);
+  return g;
+}
+
+/**
+ * 剪纸眼睛：一张深色纸压在画面上，中间剪出一个杏仁形的洞。
+ * 洞外是纸，洞里是整片夜海——「你眼中」就是把纸剪开，看见那张纸后面的世界。
+ *
+ * 三条硬规矩（破坏了就不像纸）：
+ *   1. 洞的形状不对称——手工剪的，右眼角比左眼角高一点；
+ *   2. 洞的边要露一圈米色底纸（套色错位），这是「两张纸叠着」的唯一证据；
+ *   3. 睫毛不是画的线，是从纸边上剪出来的三角齿。
+ */
+/** 杏仁形剪口的路径（本地坐标，中轴在 LY 上）。eyeSheet 与洞内裁剪共用同一条曲线，
+ *  否则剪纸的纸边和洞里的世界会错开，一眼看出是两层图。 */
+function eyeHolePath(rx, ry) {
+  const LY = -ry * .05;
+  return `M${-rx},${(LY + ry * .12).toFixed(1)} ` +
+    `C${(-rx * .58).toFixed(1)},${(LY - ry * 1.02).toFixed(1)} ` +
+    `${(rx * .48).toFixed(1)},${(LY - ry * 1.20).toFixed(1)} ` +
+    `${rx},${(LY - ry * .22).toFixed(1)} ` +
+    `C${(rx * .54).toFixed(1)},${(LY + ry * 1.00).toFixed(1)} ` +
+    `${(-rx * .56).toFixed(1)},${(LY + ry * 1.04).toFixed(1)} ` +
+    `${-rx},${(LY + ry * .12).toFixed(1)} Z`;
+}
+function eyeSheet(parent, rx, ry, P) {
+  const g = g_(parent, { class: 'esheet' });
+  const LY = -ry * .05;
+  const eyeY = x => LY - ry * 1.04 * Math.sqrt(Math.max(0, 1 - Math.pow(x / rx, 2)));
+
+  const hole = eyeHolePath(rx, ry);
+  const sheet =
+    `M${-W * 1.4},${-H * 1.4} H${W * 1.4} V${H * 1.4} H${-W * 1.4} Z ` + hole;
+
+  // 底纸：错位几像素露出来的一圈米色，套色没对准的样子
+  path_(sheet, '#efe0bf', g, { 'fill-rule': 'evenodd', transform: 'translate(-5.5,-6.5)' });
+  // 纸本体：近黑的一层，不许是纯黑，也压不过洞里的天光
+  path_(sheet, grad('#1b1426', '#08050d', true), g, { 'fill-rule': 'evenodd' });
+  // 剪口：纸厚。外沿一道亮口，内沿一道暗，纸才有厚度
+  path_(hole, 'none', g, { stroke: 'rgba(0,0,0,.55)', 'stroke-width': 13 });
+  path_(hole, 'none', g, { stroke: 'rgba(255,240,214,.18)', 'stroke-width': 2.2 });
+
+  // 睫毛：从纸边上长进洞里的三角齿。裁到洞口以内，齿根被剪掉，只剩齿尖——
+  // 这是剪纸里唯一正确的「睫毛」写法，画一条描边线就立刻变插画。
+  const cL = 'el' + (++gid);
+  const cpL = mk('clipPath', { id: cL }, DEFS);
+  path_(hole, '#000', cpL);
+  const lg = g_(g, { 'clip-path': `url(#${cL})` });
+  const rl = rng(847);
+  /* 睫毛不能是一排等距等长的三角——那是梳子。
+     真睫毛是「几簇 + 往外张 + 长短差很大」：
+     ① 位置成簇（组距不等，簇内挤），不是从头到尾均匀排开；
+     ② 尖端向外歪，眼角那几根最长，形成一把打开的扇；
+     ③ 长度是重尾的，多数短、少数很长。 */
+  const groups = [-.66, -.26, .16, .58];
+  const cnts = [2, 3, 3, 2];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const gx = groups[gi];
+    const dir = gx < 0 ? -1 : 1;
+    for (let j = 0; j < cnts[gi]; j++) {
+      const x = rx * gx + (rl() - .5) * rx * .11 + j * dir * rx * .045;
+      const base = eyeY(x) - ry * .34;
+      const len = ry * (.14 + Math.pow(rl(), 1.55) * .48) * (gi >= 2 ? 1.16 : 1);
+      const tip = eyeY(x) + len;
+      const tilt = dir * len * (.22 + rl() * .42);   // 尖端往外张
+      const hw = rx * (.022 + rl() * .024);
+      path_(`M${(x - hw).toFixed(1)},${base.toFixed(1)} L${(x + tilt).toFixed(1)},${tip.toFixed(1)} ` +
+        `L${(x + hw).toFixed(1)},${base.toFixed(1)} Z`,
+        grad('#120c1c', '#040208', true), lg);
+      // 齿的一侧留一道纸厚的亮口，睫毛才不是一块黑
+      path_(`M${(x - hw).toFixed(1)},${base.toFixed(1)} L${(x + tilt).toFixed(1)},${tip.toFixed(1)}`,
+        'none', lg, { stroke: 'rgba(255,236,200,.12)', 'stroke-width': 1.4 });
+    }
+  }
+  return g;
+}
+
+/** 路人剪影：一排，高低错落。
+ *  早先一个人是「窄梯形 + 头顶一个圆」——没有肩、没有腿缝，
+ *  一排摆开就成了一排栅栏桩。剪影认人只靠三处：肩比胯宽、两条腿分开、头略偏。 */
+function crowd(parent, n, seed, col) {
+  const r = rng(seed || 11);
+  const g = g_(parent, { class: 'crowd' });
+  const list = [];
+  for (let i = 0; i < n; i++) {
+    const p = g_(g);
+    /* 身高差要拉大。全是 86~140 的时候缩到 0.5 倍，一排人高矮相差 27px，
+       看上去是一排等高木桩；真正的街景里 1.4m 和 1.9m 是并排走的。 */
+    const hh = 78 + r() * 96;
+    const ww = hh * (.125 + r() * .050);     // 半肩宽
+    const hip = -hh * (.44 + r() * .05);
+    const hx = (r() - .5) * hh * .07;
+    const lean = (r() - .5) * .07;           // 每个人倚的角度不同，一排人才不像栅栏
+    // 躯干：肩略圆、往下收一点
+    path_(`M${(-ww).toFixed(1)},${hip.toFixed(1)} L${(-ww).toFixed(1)},${(-hh * .64).toFixed(1)} ` +
+      `Q${(-ww).toFixed(1)},${(-hh * .74).toFixed(1)} 0,${(-hh * .74).toFixed(1)} ` +
+      `Q${ww.toFixed(1)},${(-hh * .74).toFixed(1)} ${ww.toFixed(1)},${(-hh * .64).toFixed(1)} ` +
+      `L${ww.toFixed(1)},${hip.toFixed(1)} Z`, col, p);
+    // 两条腿：中间那道缝是关键，没有它就是一根桩
+    path_(`M${(-ww * .92).toFixed(1)},0 L${(-ww * .16).toFixed(1)},0 ` +
+      `L${(-ww * .26).toFixed(1)},${hip.toFixed(1)} L${(-ww * .96).toFixed(1)},${hip.toFixed(1)} Z`, col, p);
+    path_(`M${(ww * .16).toFixed(1)},0 L${(ww * .92).toFixed(1)},0 ` +
+      `L${(ww * .96).toFixed(1)},${hip.toFixed(1)} L${(ww * .26).toFixed(1)},${hip.toFixed(1)} Z`, col, p);
+    // 脖子 + 头：头往一侧偏一点，一排人才不像卫兵
+    rect(hx * .5 - ww * .18, -hh * .82, ww * .36, hh * .10, col, p);
+    circ(hx, -hh * .90, hh * .105, col, p);
+    list.push({ g: p, off: r(), yoff: r(), lean });
+  }
+  g.__list = list;
+  return g;
+}
+/* ---------------- 7. 场景原语（9 种镜头） ---------------- */
+/* 每个场景函数签名：build(parent, s, dur) → { g, update(tl) }
+   tl 是本场景内的时间（0..dur）。所有动效必须只依赖 tl。 */
+
+const DEFS = mk('defs', null, document.getElementById('art'));
+let gid = 0;
+function grad(c1, c2, vertical) {
+  const id = 'lg' + (++gid);
+  const lg = mk('linearGradient', { id, x1: 0, y1: 0, x2: vertical ? 0 : 1, y2: vertical ? 1 : 0 }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': c1 }, lg);
+  mk('stop', { offset: 1, 'stop-color': c2 }, lg);
+  return `url(#${id})`;
+}
+/** 天空：一整块渐变纸 */
+function sky(g, c1, c2) { return rect(0, 0, W, H, grad(c1, c2, true), g); }
+
+/* ---- 统一骨架：九个镜共用，缺一层画面就塌 ---- */
+/** 空气光：从光源位置向下扩散的一团柔光。压住远景、拉开纵深，是「光从后面打过来」的来源。 */
+function airGlow(root, x, y, r, col, op) {
+  const g = g_(root, { class: 'air' });
+  const id = 'ag' + (++gid);
+  const rg = mk('radialGradient', { id }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': col, 'stop-opacity': op }, rg);
+  mk('stop', { offset: .42, 'stop-color': col, 'stop-opacity': (op * .42).toFixed(3) }, rg);
+  mk('stop', { offset: .74, 'stop-color': col, 'stop-opacity': (op * .12).toFixed(3) }, rg);
+  mk('stop', { offset: 1, 'stop-color': col, 'stop-opacity': 0 }, rg);
+  return circ(x, y, r, `url(#${id})`, g);
+}
+
+/** 四层海：远浅近深，逐层加大投影、加错版白边。
+ *  返回从上到下的数组，场景里按 index 做逐拍升起/落下。 */
+function seaStack(root, P, opt) {
+  const o = Object.assign({ top: H * .56, gap: 62, amp: 12, seed: 300,
+    white: '#f7efdd', count: 4, i0: 0,
+    ampStep: 2.4, hiI: .16, hiStep: .05 }, opt);
+  /* 色板只有四档，可尾声要六层。第五、六层如果直接落回 ink，
+     就和上一层同一个颜色，画面底部糊成一块没有层次的死黑。
+     层数超出档数时，在「最远色 → 末档 → 墨色」之间按层数重新取样，
+     保证任意两层都差一点点——纸质层叠的全部说服力就在这点差值上。
+
+     注意取样用的是**全局层号 i**，不是段内序号 k。
+     早先这里写 ramp[k]，于是「拆成两段画」的那些镜（①②⑤⑦）里，
+     后半段又从最亮的 sea[0] 重新开始，中景整片海被提亮了一整级
+     （实测该处 L=75，本该是 29），四层立刻分不出远近。 */
+  const N = P.sea.length;
+  const total = Math.max(N, o.i0 + o.count);
+  const ramp = [];
+  for (let i = 0; i < total; i++) {
+    if (i < N) { ramp.push(P.sea[i]); continue; }
+    const t = total > 1 ? i / (total - 1) : 1;
+    ramp.push(t < .5
+      ? mixHex(P.sea[0], P.sea[N - 1], t * 2)
+      : mixHex(P.sea[N - 1], P.ink, (t - .5) * 2 * .82));
+  }
+  const arr = [];
+  for (let k = 0; k < o.count; k++) {
+    const i = o.i0 + k;                           // 拆成两段画时，层的序号不能重新从 0 数
+    /* 扇贝段数必须由纵深推出来，不能手工给常数。
+       越远的浪越碎（一屏十几道），越近的浪越整（一屏六七道）——
+       这是「远小近大」在浪上的唯一体现。
+       早先这里用 teeth0 + k*teethStep，默认 8、10、12⋯⋯方向正好相反：
+       越近段数越多、振幅还越大，底下几层就成了一把高频碎锯齿，
+       再叠上每层那条描边，整片海读成心电图。 */
+    const seg = Math.max(5, Math.round(W / (100 + i * 34)));
+    arr.push(paperLayer(root, {
+      y: o.top + k * o.gap,
+      amp: o.amp + k * o.ampStep,
+      seed: o.seed + k,
+      teeth: seg,
+      /* 浪高上限按层距给：一层浪最多吃掉层距的 74%，
+         这样每层都稳稳套在上一层下面，四层像抽开的千层纸。
+         超过层距，近层的浪尖就翻到远层基线之上，海立刻变成「山」。 */
+      cap: o.gap * .74,
+      fill: ramp[i],
+      // 每一层都是一张独立的纸，所以每一层都该有自己那条错版白边。
+      // 但白边的强度必须压住：0.34 的白压在 0.3 亮度的蓝上，
+      // 直接跳 50 级灰，一条一条平行下去就是一张等高线地图。
+      misreg: k ? o.white : null,
+      misregO: Math.max(.10, .19 - i * .028),
+      face: P.glow,
+      hi: 'rgba(255,255,255,' + (o.hiI + k * o.hiStep).toFixed(3) + ')',
+      shadow: 10 + i * 4,
+      // 投影别一路加到 0.55：四层各压一次，越靠近前景越黑，
+      // 到第四层 fill 和 shade 已经分不出来了，海面就成了「一条黑边」。
+      shade: `rgba(4,11,20,${(.34 + i * .04).toFixed(3)})`
+    }));
+  }
+  return arr;
+}
+
+/* ---- ① 启航 ---- */
+function scSail(parent, s, dur) {
+  const P = PAL.night;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+
+  const mx = W * .63, my = H * .255, mr = 118;
+  airGlow(root, mx, my, mr * 6.2, P.warm, .30);
+  const st = stars(root, 58, 101);
+  const mo = moon(root, mx, my, mr, P.moon);
+  // 海天交界垫一层暖雾，不许是硬线
+  rect(0, H * .40, W, H * .34, grad('rgba(246,236,210,0)', 'rgba(232,184,120,.16)', true), root);
+
+  // 海分远近两段：远浪齿密而矮，近浪齿疏而缓。
+  // 海分远近两段，段数由 seaStack 按纵深自动定：远浪碎、近浪整。
+  // 倒影夹在中间画——压在浪层之上就会浮成一条白横梯。
+  const waves = seaStack(root, P, { top: H * .566, gap: 58, amp: 4.5, seed: 300,
+    count: 2, i0: 0, ampStep: 2, hiI: .07, hiStep: .03 });
+  reflect(root, mx, H * .578, H * .735, mr * 1.9, '#f2e2c2', 311);
+  waves.push(...seaStack(root, P, { top: H * .566 + 116, gap: 58, amp: 8.5, seed: 302,
+    count: 2, i0: 2, ampStep: 2, hiI: .10, hiStep: .03 }));
+
+  const bo = boat(root, W * .40, H * .79, 1.35, { hull: '#eddfc2', sail: '#fdf6e4' });
+  const kd = kid(root, W * .40 + 4, H * .79 - 19, .74, { glow: true, body: '#334f6c' });
+  nearWave(root, H * .958, P.ink, 309);
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      tr(mo, mx, my + Math.sin(t * .7) * 5, 1 + Math.sin(t * .45) * .014);
+      // 每拍升起一层：浪是「拍」出来的，不是滑上来的
+      waves.forEach((w, i) => {
+        const p = easeOutQuint(prog(b, i * .92, i * .92 + .78));
+        w.setAttribute('transform', `translate(0,${((1 - p) * 240).toFixed(1)})`);
+      });
+      // 第 6 拍：小纸船冒出浪头
+      const pb = easeOutBack(prog(b, 5.6, 6.6));
+      const by = H * .79 + (1 - pb) * 170 + Math.sin(t * 2.2) * 6;
+      tr(bo, W * .40 + Math.sin(t * 1.1) * 9, by, 1.35);
+      tr(kd, W * .40 + 4 + Math.sin(t * 1.1) * 9, by - 19, .74);
+      setOpacity(bo, prog(b, 5.6, 6.1)); setOpacity(kd, prog(b, 5.6, 6.1));
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .28 + .6 * Math.pow(.5 + .5 * Math.sin(beatPos(t) * Math.PI + i * 1.7), 2)));
+      tr(cam, 0, 0, 1 + .035 * prog(b, 0, 6.5));
+    }
+  };
+}
+
+/* ---- ② 孤夜 ---- */
+function scNight(parent, s, dur) {
+  const P = PAL.deep;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+  const st = stars(root, 82, 202);
+
+  const mx = W * .545, my = H * .245, mr = 132;
+  airGlow(root, mx, my, mr * 7.4, P.glow, .20);
+  const mo = moon(root, mx, my, mr, P.moon);
+
+  // 云：两条被月光透亮的长纸，横着切过月面
+  const c1 = cloud(root, W * .16, H * .26, .92, '#1d3145', 31);
+  const c2 = cloud(root, W * .88, H * .17, .70, '#182a3c', 47);
+
+  const waves = seaStack(root, P, { top: H * .706, gap: 56, amp: 9, seed: 401 });
+  reflect(root, mx, H * .706, H * .97, mr * 1.7, '#cfdae2', 411);
+
+  const bo = boat(root, W * .285, H * .845, .58, { hull: '#c6b9a2' });
+  const kd = kid(root, W * .285 - 3, H * .845 - 7, .44, { glow: true, body: '#2b3d52' });
+  nearWave(root, H * .978, P.ink, 409);
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 极缓推近，孤夜要静
+      tr(cam, 0, 0, 1 + .045 * prog(b, 0, at(1)));
+      // 云过月：一拍一拍往左压，月亮被吃掉一半再吐出来
+      const pc = easeInOut(prog(b, at(.14), at(.80)));
+      tr(c1, lerp(W * .10, W * .40, pc), H * .26 - pc * 14, .92 + pc * .12);
+      tr(c2, lerp(W * .96, W * .72, pc), H * .17 + pc * 10, .70, -3 + pc * 3);
+      /* 云过月只需要「被压暗一点」，不能把整张月亮淡到 .34。
+         纸是不透明的：云从前面盖过去就够了，月自己变半透明立刻变成
+         一颗灰玻璃球——本轮九宫格第 2 镜就是这么灰掉的。 */
+      setOpacity(mo, lerp(1, .74, Math.sin(pc * Math.PI) * .92));
+      // 舟随浪
+      const sway = Math.sin(t * 1.35) * 4;
+      tr(bo, W * .285 + Math.sin(t * .9) * 7, H * .845 + sway, .58);
+      tr(kd, W * .285 - 3 + Math.sin(t * .9) * 7, H * .845 - 7 + sway, .44);
+      // 星：半拍呼吸
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .18 + .68 * Math.pow(.5 + .5 * Math.sin(beatPos(t) * Math.PI + i * 2.3), 3)));
+    }
+  };
+}
+
+/* ---- ③ 想着你 ---- */
+function scMiss(parent, s, dur) {
+  const P = PAL.dusk1;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+  const st = stars(root, 40, 302);
+
+  // 仰视的月：够大但不再占掉三分之一个画面——月一大，光晕就把整帧的天压没了
+  const mx = W * .50, my = H * .335, mr = H * .205;
+  airGlow(root, mx, my, mr * 3.2, P.warm, .20);
+  const mo = moon(root, mx, my, mr, P.moon, { glow: .8 });
+
+  // 两层薄云横过月面，高度错开：一条压住月的中段，一条擦过月的上沿
+  const clB = cloud(root, W * .60, H * .262, 1.05, '#4a4468', 352,
+    { face: P.glow, misreg: '#efe0bf' });
+  const clA = cloud(root, W * .34, H * .372, 1.55, '#3f3a5e', 351,
+    { face: P.glow, shadow: 13 });
+
+  const waves = seaStack(root, P, { top: H * .745, gap: 50, amp: 8, seed: 402 });
+  reflect(root, mx, H * .745, H * .99, mr * 1.15, '#f2e2c4', 421);
+
+  // 前景礁石：撕纸，纯剪影，人站在上面
+  paperLayer(root, {
+    y: H * .905, amp: 34, seed: 430, teeth: 6, mode: 'torn',
+    fill: P.ink, shadow: 0, rim: 0, shade: 'rgba(0,0,0,0)'
+  });
+  const kd = kid(root, W * .50, H * .905, 1.18, { glow: true, body: '#33324c', hair: '#1b1a28' });
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 仰视：镜头极缓推近，月亮压下来
+      tr(cam, 0, 0, 1 + .07 * prog(b, 0, at(1)));
+      tr(clA, lerp(W * .16, W * .52, easeInOut(prog(b, at(.08), at(.92)))), H * .372 + Math.sin(t * .55) * 6, 1.55);
+      tr(clB, lerp(W * .70, W * .34, easeInOut(prog(b, at(.08), at(.92)))), H * .262 + Math.sin(t * .47 + 1.4) * 5, 1.05);
+      tr(mo, mx, my + Math.sin(t * .5) * 4, 1 + Math.sin(t * .38) * .012);
+      // 人几乎不动，只有呼吸
+      tr(kd, W * .50, H * .905 + Math.sin(t * 1.05) * 2.2, 1.18);
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .22 + .6 * Math.pow(.5 + .5 * Math.sin(beatPos(t) * Math.PI * .8 + i * 1.9), 2)));
+    }
+  };
+}
+
+/* ---- ④ 不惶恐 ---- */
+function scBrave(parent, s, dur) {
+  const P = PAL.dusk1;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+  const st = stars(root, 34, 404);
+
+  const mx = W * .72, my = H * .225, mr = 122;
+  airGlow(root, mx, my, mr * 6.8, P.warm, .26);
+  const mo = moon(root, mx, my, mr, P.moon);
+
+  /* 「巨」不靠一道立起来的卷浪。
+     这一镜试过三代生成器：单片高振幅扇贝 → 实心单轮廓卷浪 → 弧带叠压卷浪，
+     单帧里依次读成「蓝色山脉」「带缺口的山」「拱门/隧道口」。
+     结论写进 learnings：**静止单帧里，一个轮廓完整、体量高大的深色团块，
+     只有两种解释——山，或者建筑。** 浪要显得巨，只有三条路：
+     层数多、参照物小、前景压边。这正好是 references/20 定义的扇贝浪语言。 */
+  /* 层高必须按层距封顶（cap = 层距 × .74），否则浪尖会翻到上一层基线之上。
+     这里原先给 amp 22/30/36/24 却不传 cap：A0 = amp×6 = 190，浪尖能顶到 262px，
+     而四层的层距只有 58~63px —— 于是每一道浪都长成一堵三四倍层距高的墙，
+     峰顶到谷底的水平距离只有落差的 1/3，剪影自带一道悬崖。
+     1:1 放大后看得清清楚楚：那不是「浪尖尖」，是「山坡陡」。
+     收进层距之内以后，扇贝才有资格是扇贝：宽 200~380、高 20~42，弧顶自然就是圆的。 */
+  const seaL = [
+    /* 扇贝密度不能拍脑袋。seaStack 的既定规则是「一屏 11~19 道，远的碎近的整」，
+       按 W/(100+i*34) 推：1920 宽下依次约 19/16/13/11 道。
+       这里早先写 5~9 道，弧宽三四百像素——**再圆的一根弧，宽到 400px 就是个土丘**。
+       密度对了，同样的振幅才读成海。 */
+    { y: H * .750, amp: 9.0, teeth: 18, cap: 52, fill: P.sea[0], o: 0 },
+    { y: H * .808, amp: 10.0, teeth: 15, cap: 50, fill: mixHex(P.sea[0], P.sea[2], .50), o: 1 },
+    { y: H * .864, amp: 11.0, teeth: 13, cap: 49, fill: P.sea[1], o: 2 },
+    { y: H * .918, amp: 10.0, teeth: 11, cap: 49, fill: P.sea[2], o: 3 }
+  ].map((c, i) => paperLayer(root, {
+    seed: 420 + i, y: c.y, amp: c.amp, teeth: c.teeth, cap: c.cap, fill: c.fill,
+    misreg: i === 2 ? '#f7efdd' : null, misregO: .16,
+    face: i === 2 ? P.glow : null,
+    hi: `rgba(255,255,255,${(.24 - i * .035).toFixed(3)})`,
+    rim: 2.8 - i * .3, shadow: 16 + i * 7,
+    shade: `rgba(4,12,22,${(.40 + i * .055).toFixed(2)})`
+  }));
+
+  /* 前景压边：贴着画面底边的一道近浪，只在最前面，用来把「镜头很低」这件事说清楚。
+     它必须深、必须矮，只露出浪尖——前景一高就变成另一座山。
+     早先 y=1.04H、amp=96 且不封顶，浪尖一路顶到 0.80H，把第 2、3 层整个吞掉，
+     单帧读成「三座黑色圆丘」。现在收到 0.115H 的封顶，只有最高的两三道露出画面。 */
+  const fore = paperLayer(root, {
+    y: H * 1.020, amp: 26, seed: 431, teeth: 3, cap: H * .115,
+    fill: mixHex(P.sea[2], '#05070e', .46),
+    hi: 'rgba(255,255,255,.10)', rim: 2, shadow: 0, shade: 'rgba(3,8,16,.62)'
+  });
+
+  const wh = whale(root, W * .78, H * .808, 1.00, '#2b4562');
+  const bo = boat(root, W * .28, H * .793, .95, { hull: '#e6d8bb' });
+  const kd = kid(root, W * .28 + 3, H * .793 - 15, .70, { glow: true, body: '#33415c' });
+  const back = seaL;
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 四层浪从下往上依次顶起来：一层一层起，不齐平，才有「涌」的先后
+      back.forEach((w, i) => {
+        const p = easeOutQuint(prog(b, i * .22, i * .22 + .78));
+        w.setAttribute('transform', `translate(0,${((1 - p) * 150).toFixed(1)})`);
+      });
+      const pf = easeOutQuint(prog(b, at(.30), at(.92)));
+      fore.setAttribute('transform', `translate(0,${((1 - pf) * 130).toFixed(1)})`);
+      // 船往右前方划，压过第三道浪背。
+      // 仰角是负的：SVG 的 rotate 顺时针为正，船头在右，
+      // 要「抬头」就得往逆时针转——写成 +7 是船头往下扎。
+      const p2 = easeInOut(prog(b, at(.10), at(.86)));
+      const bx = lerp(W * .28, W * .44, p2);
+      const by = lerp(H * .775, H * .812, p2) + Math.sin(t * 1.9) * 7;
+      const tilt = lerp(4, -12, p2) + Math.sin(t * 1.9) * 2.2;
+      tr(bo, bx, by, .95, tilt);
+      tr(kd, bx + 3, by - 15, .70, tilt);
+      // 鲸在重拍跃出，走一条弧
+      const p3 = easeInOut(prog(b, at(.52), at(1)));
+      const arc = Math.sin(p3 * Math.PI);
+      tr(wh, lerp(W * .66, W * .90, p3), H * .808 - arc * 170, 1.00, lerp(26, -30, p3));
+      setOpacity(wh, arc > .02 ? 1 : 0);
+      setOpacity(mo, lerp(.4, 1, easeInOut(prog(b, at(.45), at(.82)))));
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .2 + .6 * Math.pow(.5 + .5 * Math.sin(beatPos(t) * Math.PI + i * 2), 2)));
+      tr(cam, 0, 0, 1 + .05 * prog(b, 0, at(1)));
+    }
+  };
+}
+
+/* ---- ⑤ 人来人往 ---- */
+function scDock(parent, s, dur) {
+  const P = PAL.dusk2;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+
+  // 落日低低压在水平线上：全片最暖的一团光
+  const sx = W * .62, sy = H * .60, sr = 148;
+  airGlow(root, sx, sy, sr * 6.4, P.warm, .40);
+  circ(sx, sy, sr * 1.10, 'rgba(255,217,168,.20)', root);
+  circ(sx, sy, sr, '#ffd9a8', root);
+
+  const waves = seaStack(root, P, { top: H * .655, gap: 54, amp: 8, seed: 500 });
+  reflect(root, sx, H * .655, H * .99, sr * 1.5, '#ffcf9a', 501);
+
+  const dk = dock(root, W * .48, H * .715, W * .96, 'rgba(46,22,30,.95)');
+
+  // 人流：三排剪影，越远越淡，方向相反。
+  // 每排 18 个人（早先 8 个）：8 个人铺在 2320px 上间距 290px，
+  // 剪影一排等距摆开就是一道篱笆。人群是「挤」出来的，不是摆出来的。
+  const rows = [];
+  for (let r = 0; r < 3; r++) {
+    /* 远近靠「掺天色」表达，不靠调透明度。
+       早先三排同色、透明度 .40/.66/.92，结果整排剪影半透明：
+       山、海、后面的人都从人身上透出来，读成一群玻璃幽灵。
+       纸永远是不透明的，远纸只是被空气染淡了颜色。 */
+    const col = mixHex('#1a0c12', P.sky[1], [.48, .27, .06][r]);
+    rows.push(crowd(root, 18, 600 + r, col));
+  }
+
+  // 前景两个人：停在人流里不动
+  const her = kid(root, W * .30, H * .855, .90, { body: '#7a3348', hair: '#241820' });
+  const him = kid(root, W * .71, H * .895, .76, { body: '#2e3242', hair: '#1a1a24' });
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      const ph = beatPos(t);
+      rows.forEach((c, ri) => {
+        const dir = ri === 1 ? -1 : 1;
+        const baseY = H * (.752 + ri * .055);
+        c.__list.forEach((p, i) => {
+          const n = c.__list.length;
+          const spread = (W + 400) / n;
+          /* 间距必须抖。`i * spread` 是等差，一排人等距离站开，
+             不管人形画得多准，读出来都是一道篱笆——等距离重复＝印花。
+             抖动量是固定 seed，所以每一帧位置不变，人不会抖。 */
+          let x = (i * spread + (p.off - .5) * spread * .80 +
+            dir * (ph % 4) * spread * .48) % (W + 400) - 200;
+          if (x < -200) x += W + 400;
+          // 缩放到 0.72 / 0.86 / 1.0：早先 0.52 起步，一个人只有 45px 高，
+          // 在 1080 上连腿缝都看不清，剩下的只有一根竖线。
+          tr(p.g, x, baseY + (p.yoff - .5) * 26, .72 + ri * .14, p.lean);
+          setOpacity(p.g, 1);
+        });
+      });
+      // 两个人只呼吸，不随人流走
+      tr(her, W * .30, H * .855 + Math.sin(t * 1.3) * 2, .90);
+      tr(him, W * .71, H * .895 + Math.sin(t * 1.1 + 1) * 2, .76);
+      tr(dk, W * .48, H * .715 + Math.sin(t * .8) * 1.5, 1);
+      tr(cam, 0, 0, 1 + .04 * prog(b, 0, at(1)));
+    }
+  };
+}
+
+/* ---- ⑥ 离开 ---- */
+function scLeave(parent, s, dur) {
+  const P = PAL.dusk2;
+  const cam = g_(parent);
+  const halfW = W / 2 + 30;
+
+  // 两张纸像幕布一样分开：左边是黄昏码头，右边是夜海小船。
+  // 两张纸底下先铺一层「缝里的东西」——不铺的话分开时会露出页面底色，
+  // 读起来像画框破了个洞，而不是纸被撕开。
+  const voidG = g_(cam);
+  /* 缝后不能是黑的。黑缝 + 两条白边 = 一根黑灯柱挂着两片灯罩，
+     这是第 6 镜最刺眼的一处误读。纸被撕开时，背面是有光透进来的，
+     所以底下铺的是暖色（黄昏正在从左边漏到右边去），不是夜色。 */
+  rect(0, 0, W, H, grad('#3a2029', '#0d070c', true), voidG);
+  airGlow(voidG, halfW, H * .46, 640, '#ffc48a', .30);
+  // 贴着缝的一道竖向暖光：撕口里透出来的那一线，比大范围柔光更能说明「后面有光」
+  const seamId = 'sm' + (++gid);
+  const smg = mk('linearGradient', { id: seamId, x1: 0, y1: 0, x2: 1, y2: 0 }, DEFS);
+  mk('stop', { offset: 0, 'stop-color': '#ffc48a', 'stop-opacity': 0 }, smg);
+  mk('stop', { offset: .5, 'stop-color': '#ffe0b0', 'stop-opacity': .55 }, smg);
+  mk('stop', { offset: 1, 'stop-color': '#ffc48a', 'stop-opacity': 0 }, smg);
+  rect(halfW - 150, 0, 300, H, `url(#${seamId})`, voidG);
+  const L = g_(cam), R = g_(cam);
+  /* 裁剪边本身就是撕口，不是一条直线。
+     直线边 + 一条波浪白边 = 白边悬在缝里，怎么调都对不上；
+     只有当纸的断口和纸芯白边是同一条曲线，撕痕才长在纸上。
+     两个 seed 必须和下面 tearStrip 用的一致（733 / 741）。 */
+  const jgL = tearJag(H + 80, 733), jgR = tearJag(H + 80, 741);
+  const lclip = mk('clipPath', { id: 'clipL' }, DEFS);
+  path_('M-12,-60 L' + jgL.out.map((x, i) => (halfW + x).toFixed(1) + ',' + jgL.ys[i].toFixed(1))
+    .join(' L') + ` L-12,${H + 60} Z`, '#000', lclip);
+  const rclip = mk('clipPath', { id: 'clipR' }, DEFS);
+  path_('M' + jgR.out.map((x, i) => (halfW + x).toFixed(1) + ',' + jgR.ys[i].toFixed(1))
+    .join(' L') + ` L${W + 12},${H + 60} L${W + 12},-60 Z`, '#000', rclip);
+
+  const Lg = g_(L, { 'clip-path': 'url(#clipL)' });
+  rect(0, 0, W, H, grad(P.sky[0], P.sky[1], true), Lg);
+  airGlow(Lg, halfW * .52, H * .58, 430, P.warm, .38);
+  circ(halfW * .52, H * .615, 122, '#ffd9a8', Lg);
+  for (let i = 0; i < 3; i++) {
+    paperLayer(Lg, { y: H * .715 + i * 56, amp: 9 + i * 3, seed: 705 + i, teeth: 8 + i * 2,
+      fill: P.sea[i + 1], misreg: i ? '#f7efdd' : null, misregO: .20,
+      shadow: 12 + i * 4, hi: 'rgba(255,255,255,.18)', shade: 'rgba(20,8,14,.50)' });
+  }
+  dock(Lg, halfW * .52, H * .705, halfW * .98, 'rgba(46,22,30,.95)');
+  const her = kid(Lg, halfW * .60, H * .665, 1.12, { body: '#7a3348', hair: '#241820' });
+
+  const Rg = g_(R, { 'clip-path': 'url(#clipR)' });
+  rect(0, 0, W, H, grad('#1a2b40', '#0a131d', true), Rg);
+  const mo2 = moon(Rg, W * .82, H * .255, 80, '#f3ead4');
+  for (let i = 0; i < 3; i++) {
+    paperLayer(Rg, { y: H * .725 + i * 54, amp: 8 + i * 3, seed: 715 + i, teeth: 7 + i * 2,
+      fill: ['#11253a', '#16324c', '#1b3d5c'][i], misreg: i ? '#e8eef2' : null, misregO: .14,
+      shadow: 10 + i * 4, hi: 'rgba(255,255,255,.16)', shade: 'rgba(2,8,14,.55)' });
+  }
+  reflect(Rg, W * .82, H * .725, H * .99, 118, '#dfe6ea', 721);
+  const bo = boat(Rg, W * .82, H * .805, .72, { hull: '#dccdae' });
+  const him = kid(Rg, W * .82 - 4, H * .805 - 10, .56, { glow: true, body: '#2b3d52' });
+
+  // 撕开的纸边：两张纸真的分开（裁剪窗口跟着走），不再是盖一条黑矩形。
+  // 早先 gapFill 最宽 422px 的黑带压在画面上，两张纸其实没动。
+  const seamG = g_(cam);
+  const tearL = tearStrip(seamG, H + 80, 733, 'rgba(240,229,207,.78)', 9, 'R');
+  const tearR = tearStrip(seamG, H + 80, 741, 'rgba(226,214,192,.64)', 8, 'L');
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 分开卡在重拍
+      const p = easeInOut(prog(b, at(.26), at(.72)));
+      /* 缝宽要有上限。W*.030 时两边各挪 58px，中间空出 115px 的洞，
+         再叠上两条纸芯白边，整条缝就成了一句竖着的黑杠。
+         撕开的纸是「撕」，不是「劈」——两张纸的断口几乎还咬着。 */
+      const gap = p * W * .019;
+      L.setAttribute('transform', `translate(${-gap.toFixed(1)},0)`);
+      R.setAttribute('transform', `translate(${gap.toFixed(1)},0)`);
+      // 裁剪窗口不必跟着改：SVG 的 clip-path 用元素自身的用户坐标系，
+      // 元素一 translate，裁剪框就跟着走，纸边自然就分开了。
+      // （之前在这里又收了一次宽度，缝隙被放大成两倍，撕边还浮在缝中间。）
+      tr(her, halfW * .60, H * .665 + Math.sin(t * 5.0) * 3, 1.12, Math.sin(t * 5.0) * 3);
+      tr(bo, W * .82 + p * 46, H * .805 + Math.sin(t * 1.4) * 5, .72);
+      tr(him, W * .82 - 4 + p * 46, H * .805 - 10 + Math.sin(t * 1.4) * 5, .56);
+      tr(tearL, halfW - gap, -40, 1);
+      tr(tearR, halfW + gap, -40, 1);
+      setOpacity(seamG, prog(b, at(.14), at(.28)));
+      tr(cam, 0, 0, 1 + .02 * prog(b, 0, at(1)));
+    }
+  };
+}
+
+/* ---- ⑦ 感谢 ---- */
+function scThanks(parent, s, dur) {
+  const P = PAL.ember;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+  const st = stars(root, 44, 801);
+
+  const mx = W * .24, my = H * .265, mr = 92;
+  airGlow(root, mx, my, mr * 7.0, P.warm, .24);
+  const mo = moon(root, mx, my, mr, P.moon);
+
+  // 远山：两片低饱和的纸压在海平线上，被灯火从下面打亮。
+  // 山脊要用撕纸边（torn），不能用扇贝——扇贝是等周期的，放大后读成水；
+  // 而 scallopPath 还会把 amp 放大五倍，早先 amp 42 + teeth 4 出来是四个巨弧。
+  paperLayer(root, { y: H * .545, mode: 'torn', amp: 58, seed: 810, teeth: 6,
+    fill: '#241620', misreg: '#e8d3b0', misregO: .10, shadow: 10,
+    hi: 'rgba(255,190,114,.12)', shade: 'rgba(10,4,8,.50)' });
+  paperLayer(root, { y: H * .612, mode: 'torn', amp: 40, seed: 811, teeth: 9,
+    fill: '#1a1019', shadow: 12, hi: 'rgba(255,190,114,.09)',
+    shade: 'rgba(10,4,8,.55)' });
+
+  // 海分两段画，倒影夹在中间：光的碎屑必须被前面的浪挡住一部分，
+  // 全画在浪层之上就会变成一条浮在水面上方的亮梯子。
+  const waves = seaStack(root, P, { top: H * .660, gap: 50, amp: 5, seed: 802,
+    count: 2, i0: 0, ampStep: 5, hiI: .04, hiStep: .02 });
+  reflect(root, mx, H * .668, H * .815, mr * 1.45, '#ffd88f', 812);
+  waves.push(...seaStack(root, P, { top: H * .760, gap: 50, amp: 8, seed: 804,
+    count: 2, i0: 2, ampStep: 4, hiI: .10, hiStep: .03 }));
+
+  const lamps = [];
+  const r = rng(880);
+  for (let i = 0; i < 30; i++) {
+    const sc = .45 + r() * .8;
+    let lx = r() * W * 1.04 - W * .02;
+    // 别从月亮前面飞过：暖灯压在高光上会变成一块发灰的脏点，像月亮脏了
+    if (Math.abs(lx - mx) < mr * 2.1) lx += (lx < mx ? -1 : 1) * mr * 2.1;
+    lamps.push({ el: skyLantern(root, lx, H + 80, sc, 900 + i),
+      x: lx, s: sc, sp: 80 + r() * 110, d: i * .17 });
+  }
+  nearWave(root, H * .975, P.ink, 809);
+  const glow = rect(0, 0, W, H, '#ffb457', root, { opacity: 0 });
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 每半拍升起一盏：窗口按本镜拍数自动压缩，否则尾段的灯永远飞不起来
+      lamps.forEach((L, i) => {
+        const p = prog(b, L.d, L.d + at(.42));
+        const y = H + 80 - p * (H + 300) * (L.sp / 120);
+        tr(L.el, L.x + Math.sin(t * .8 + i) * 20, y, L.s, Math.sin(t * .6 + i) * 6);
+        setOpacity(L.el, prog(b, L.d, L.d + at(.06)) * (1 - prog(b, L.d + at(.34), L.d + at(.42))));
+      });
+      setOpacity(glow, .09 + .05 * pulse(t, 2, 2));
+      // 镜头往上摇
+      root.setAttribute('transform', `translate(0,${(prog(b, 0, at(1)) * 64).toFixed(1)})`);
+      tr(mo, mx, my, 1 + .05 * prog(b, 0, at(1)));
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .2 + .6 * Math.pow(.5 + .5 * Math.sin(beatPos(t) * Math.PI + i * 1.6), 2)));
+    }
+  };
+}
+
+/* ---- ⑧ 你眼中 ---- */
+function scEyes(parent, s, dur) {
+  const P = PAL.mauve;
+  const cam = g_(parent);
+  const RX = 560, RY = 300;
+  const CX = W * .5, CY = H * .50 + RY * .05;   // eyeSheet 内部把中轴上移了 5%，这里对齐
+
+  /* 1) 纸底：整帧一张近黑的纸，就是眼皮。它必须比洞里暗——
+   *    洞里的天光从纸后面透过来，观众才认得出这是「剪开的一个洞」。 */
+  const base = g_(cam);
+  rect(0, 0, W, H, grad('#1f1729', '#0a0710', true), base);
+  const rb = rng(846);
+  for (let i = 0; i < 26; i++) {                 // 纸纤维：极淡的短线，别让它变成纯色块
+    const x0 = rb() * W, y0 = rb() * H, len = 60 + rb() * 150;
+    path_(`M${x0.toFixed(0)},${y0.toFixed(0)} q${(len * .5).toFixed(0)},${((rb() - .5) * 14).toFixed(0)} ${len.toFixed(0)},${((rb() - .5) * 8).toFixed(0)}`,
+      'none', base, { stroke: 'rgba(255,240,214,.045)', 'stroke-width': 1.6 });
+  }
+  radialGlow(base, CX, H * .16, H * .58, '#ffe6b8', .07);
+
+  /* 2) 洞里：整个夜海被裁进这条杏仁缝里 */
+  const cid = 'hole' + (++gid);
+  const cpp = mk('clipPath', { id: cid }, DEFS);
+  path_(eyeHolePath(RX, RY), '#000', cpp, { transform: `translate(${CX},${CY})` });
+  const inner = g_(cam, { 'clip-path': `url(#${cid})` });
+  sky(inner, P.sky[0], P.sky[1]);
+  airGlow(inner, CX, H * .38, H * .60, P.warm, .20);
+  const st = stars(inner, 56, 871);
+  const mo = moon(inner, CX + 30, H * .395, 92, P.moon, { glow: .5 });
+  reflect(inner, CX + 30, H * .60, H * .86, 150, P.moon, 872);
+  const sea = seaStack(inner, P, { top: H * .575, gap: 44, amp: 8, seed: 880, count: 3 });
+  const bx = CX - 108, by = H * .595;
+  const bo = boat(inner, bx, by, .44, { hull: '#e6d8bb' });
+  const k1 = kid(inner, bx - 10, by - 9, .28, { body: '#4a5570', lantern: false });
+  const k2 = kid(inner, bx + 9, by - 8, .27, { body: '#8a5566', hair: '#2a1a22', lantern: false });
+
+  /* 3) 纸压下来，盖住洞以外的全世界 */
+  const eg = g_(cam);
+  tr(eg, CX, CY, 1);
+  const sh = eyeSheet(eg, RX, RY, P);
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 纸从上往下压：落位前一帧还在上方 26px，落位瞬间一顿
+      const lay = easeOut(prog(b, at(.18), at(.44)));
+      const lift = easeIn(prog(b, at(.92), at(1)));
+      setOpacity(sh, Math.min(1, prog(b, at(.06), at(.18))) * (1 - lift));
+      tr(eg, CX, CY + lerp(-30, 0, lay), 1);
+      // 推镜头进洞里：两段，都落在整拍上，合起来约 3.2 倍
+      const p1 = easeInOut(prog(b, at(.34), at(.64)));
+      const p2 = easeInOut(prog(b, at(.60), at(.90)));
+      const sc = lerp(1, 1.95, p1) * lerp(1, 1.68, p2);
+      cam.setAttribute('transform',
+        `translate(${W * .5},${H * .5}) scale(${sc.toFixed(4)}) translate(${-W * .5},${-H * .5})`);
+      // 小船随浪轻晃
+      const dy = Math.sin(t * 1.5) * 2.4;
+      tr(bo, bx, by + dy, .44);
+      tr(k1, bx - 10, by - 9 + dy, .28);
+      tr(k2, bx + 9, by - 8 + dy, .27);
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .2 + .58 * Math.pow(.5 + .5 * Math.sin(b * Math.PI + i * 1.7), 2)));
+    }
+  };
+}
+
+/* ---- ⑨ 尾声 ---- */
+function scEnd(parent, s, dur) {
+  const P = PAL.back;
+  const cam = g_(parent), root = g_(cam);
+  sky(root, P.sky[0], P.sky[1]);
+  airGlow(root, W * .5, H * .38, H * .95, P.warm, .32);
+  const st = stars(root, 40, 901);
+  const mo = moon(root, W * .5, H * .40, 200, P.moon);
+  const rf = reflect(root, W * .5, H * .50, H * .99, 250, P.moon, 903);
+  const waves = seaStack(root, P, { top: H * .545, gap: 62, amp: 13, seed: 950, count: 6 });
+  const bo = boat(root, W * .5, H * .72, 1.0, { hull: '#e6d8bb' });
+  const kd = kid(root, W * .5 - 5, H * .72 - 13, .86, { glow: true });
+  const fade = document.getElementById('fade');
+
+  return {
+    g: cam,
+    update(t) {
+      const b = beatPos(t), at = timing(dur);
+      // 每拍沉下一层纸：海面退去，露出更深的墨色。
+      // 6 层分在整镜里，一层一拍，最后一层正好压在末拍上。
+      const step = at(1) / 6;
+      waves.forEach((w, i) => {
+        const p = easeIn(prog(b, i * step, i * step + step * 1.6));
+        w.setAttribute('transform', `translate(0,${(p * 190).toFixed(1)})`);
+      });
+      // 小船驶进月亮：从海平线一路升到月面，同时缩小到消失
+      const p = easeInOut(prog(b, at(.16), at(.94)));
+      tr(bo, W * .5, lerp(H * .72, H * .40, p), lerp(1.0, .12, p));
+      tr(kd, W * .5 - 5 * (1 - p), lerp(H * .72 - 13, H * .40 - 6, p), lerp(.86, .11, p));
+      const out = prog(b, at(.74), at(.96));
+      setOpacity(bo, lerp(1, .2, out));
+      setOpacity(kd, lerp(1, .15, out));
+      setOpacity(mo, 1 + .5 * p);
+      st.__stars.forEach((c, i) =>
+        setOpacity(c, .25 + .55 * Math.pow(.5 + .5 * Math.sin(b * Math.PI + i), 2)));
+      setOpacity(fade, prog(b, at(.90), at(1)));
+    }
+  };
+}
+
+const BUILDERS = {
+  sail: scSail, night: scNight, miss: scMiss, brave: scBrave, dock: scDock,
+  leave: scLeave, thanks: scThanks, eyes: scEyes, end: scEnd
+};
+/* ---------------- 8. 纸片字幕 ---------------- */
+/* 一字一纸：每个字是独立的米色纸片，各自微旋；唱到的字变橙红。
+   这套字幕是全片统一度最高的设计，别改。 */
+const LYRIC_EL = document.getElementById('lyric');
+const LYRIC = [];
+
+/* 去掉首尾空白，同时记下前面砍了几个字——因为 words[] 是按原始 text 对齐的，
+   不记住偏移就会整体错位一个字。 */
+function trimRail(raw) {
+  const cs = [...raw];
+  let a = 0, b = cs.length;
+  while (a < b && /\s/.test(cs[a])) a++;
+  while (b > a && /\s/.test(cs[b - 1])) b--;
+  return { chars: cs.slice(a, b), skip: a };
+}
+
+function buildLyric() {
+  const src = STORY.lyrics || [];
+  const base = STORY.chSize || Math.round(H * .054);
+  src.forEach((L, li) => {
+    const raw = String(L.text || '');
+    const { chars, skip } = trimRail(raw);
+    if (!chars.length) return;
+    // words 必须与原始 text 等长才可信；长度对不上就当没有（宁可退回线性，不要错位）
+    const words = Array.isArray(L.words) && L.words.length === [...raw].length
+      ? L.words.slice(skip, skip + chars.length)
+      : null;
+    const el = document.createElement('div');
+    el.style.cssText = 'display:flex;align-items:flex-end;justify-content:center;position:absolute;left:0;right:0;bottom:0;opacity:0';
+    const nodes = [];
+    const rr = rng(1000 + li * 37);
+    chars.forEach((c, i) => {
+      if (c === ' ' || c === '　') {
+        const sp = document.createElement('span');
+        sp.className = 'ch sp';
+        sp.style.cssText = 'width:' + (base * .45) + 'px';
+        el.appendChild(sp); nodes.push(null); return;
+      }
+      const s = document.createElement('span');
+      s.className = 'ch';
+      s.textContent = c;
+      s.style.setProperty('--chsize', base + 'px');
+      s.style.transform = `rotate(${((rr() - .5) * 4).toFixed(2)}deg) translateY(${((rr() - .5) * 6).toFixed(1)}px)`;
+      s.dataset.base = s.style.transform;
+      el.appendChild(s); nodes.push(s);
+    });
+    LYRIC_EL.appendChild(el);
+    const start = L.start != null ? L.start : (L.t != null ? L.t : 0);
+    const end = L.end != null ? L.end : start + (L.dur || 3.2);
+    LYRIC.push({ el, nodes, chars, words, start, end, li });
+  });
+}
+
+/** 逐字点亮。有真实轴（L.words）就按每个字的起唱时刻走，没有才退回句内线性均分。 */
+function updateLyric(t) {
+  let shown = false;
+  for (const L of LYRIC) {
+    const visible = t >= L.start - .02 && t <= L.end + .28;
+    if (!visible) { if (L.el.style.opacity !== '0') L.el.style.opacity = '0'; continue; }
+    shown = true;
+
+    if (L.words) {
+      // 人工轴：一字的时刻到了就亮，空格位与未打的字跟住前一个字
+      let last = L.start;
+      let stop = Infinity;
+      L.nodes.forEach((nd, i) => {
+        const w = L.words[i];
+        if (w && Number.isFinite(w.t)) {
+          last = w.t;
+          // e = 这个字该收住的时刻。有停顿的地方靠它留白，不让一个字亮满整个空隙；
+          // 老数据没有 e，就按「最多亮 1.4s」兜底（正常字距都小于它，不会误伤）。
+          stop = Number.isFinite(w.e) ? w.e : w.t + 1.4;
+        }
+        if (nd) nd.classList.toggle('on', t >= last && t <= stop);
+      });
+      setOpacityEl(L.el, Math.min(1, (t - L.start + .12) / .18) * Math.min(1, (L.end + .28 - t) / .26));
+      continue;
+    }
+
+    const p = clamp((t - L.start) / Math.max(.001, L.end - L.start), 0, 1);
+    const n = L.nodes.length;
+    // 吸附：把字序号对齐到本句覆盖的拍数，让字随拍出现而不是匀速
+    const beatsInLine = Math.max(1, Math.round((L.end - L.start) / BEAT));
+    const cur = Math.min(n, Math.floor(p * (STORY.charSnap === false ? n : beatsInLine)) +
+      (STORY.charSnap === false ? 0 : 0));
+    const idx = STORY.charSnap === false ? Math.floor(p * n) : Math.floor(p * n);
+    L.nodes.forEach((nd, i) => {
+      if (!nd) return;
+      nd.classList.toggle('on', i < idx);
+    });
+    setOpacityEl(L.el, Math.min(1, (t - L.start + .12) / .18) * Math.min(1, (L.end + .28 - t) / .26));
+  }
+  LYRIC_EL.style.opacity = shown ? '1' : '0';
+}
+function setOpacityEl(e, o) { e.style.opacity = String(Math.max(0, Math.min(1, o))); }
+
+/* ---------------- 9. 时间轴装配 ---------------- */
+const ART = document.getElementById('art');
+ART.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+/* 镜头变体：同一个原语的第二次使用，靠外层 transform 换景别与朝向。
+   为什么加在这里而不是 scXxx() 里：9 个场景函数内部各自已经有一台 cam 在做推拉，
+   再往里塞参数要改 9 处、且每处语义都不同；外层只认 4 个数，写一次全原语通用。
+   这也解释了为什么「换色板」不能当变体用——色板写死在每个 scXxx() 首行（见 SKILL.md §7）。
+   zoom 只能 ≥ 1：天空是铺满 W×H 的实心 rect，缩到 1 以下四边立刻露黑边。
+   参数全缺省时一个 transform 都不写，老 story 的渲染结果必须逐像素不变。 */
+function applyVariant(g, s) {
+  const z = Number(s.zoom) || 1, px = Number(s.panX) || 0, py = Number(s.panY) || 0;
+  if (!s.flip && z === 1 && !px && !py) return;
+  const a = [];
+  if (s.flip) a.push(`translate(${W},0) scale(-1,1)`); // 镜像：另一个机位，母题一个不换
+  a.push(`translate(${(W / 2 + px).toFixed(2)},${(H / 2 + py).toFixed(2)})`);
+  if (z !== 1) a.push(`scale(${z.toFixed(4)})`);
+  a.push(`translate(${(-W / 2).toFixed(2)},${(-H / 2).toFixed(2)})`);
+  g.setAttribute('transform', a.join(' '));
+}
+
+const SCN = [];
+let CURSOR = 0;
+(STORY.scenes || []).forEach((s, i) => {
+  const dur = s.dur != null ? s.dur : (s.b != null ? s.b * BEAT : 3);
+  const start = s.start != null ? s.start : CURSOR;
+  const end = start + dur;
+  CURSOR = end;
+  const g = g_(ART, { 'data-scene': i });
+  g.style.display = 'none';
+  applyVariant(g, s);
+  const builder = BUILDERS[s.type] || scSail;
+  const inst = builder(g, s, dur);
+  SCN.push({ i, s, start, end, dur, g, update: inst.update });
+});
+
+const DUR = STORY.duration || (SCN.length ? SCN[SCN.length - 1].end : 24);
+window.__duration = DUR;
+
+/* ---------------- 10. seek：唯一的渲染入口 ---------------- */
+let LAST = -1;
+function seek(t01) {
+  const t = clamp(t01, 0, 1) * DUR;
+  let active = null;
+  for (const s of SCN) {
+    const on = t >= s.start - 1e-6 && t < s.end;
+    const disp = on ? '' : 'none';
+    if (s.g.style.display !== disp) s.g.style.display = disp;
+    if (on) { s.update(t - s.start); active = s; }
+  }
+  updateLyric(t);
+  for (let i = 0; i < TICK.length; i++) TICK[i](t);
+  // 全片淡入淡出兜底
+  const fade = document.getElementById('fade');
+  const inA = clamp(t / .35, 0, 1), outA = clamp((DUR - t) / .45, 0, 1);
+  const base = 1 - Math.min(inA, outA);
+  fade.style.opacity = String(Math.max(base, Number(fade.dataset.hold || 0)));
+  fade.dataset.hold = '';
+  LAST = t01;
+  return active ? active.i : -1;
+}
+window.seek = seek;
+
+/* ---------------- 11. 就绪 ---------------- */
+buildLyric();
+/* 调试探针：?t=0.079 定格到任意时刻；?hide=grain,fiber 逐层关闭用于二分定位 */
+const _Q = new URLSearchParams(location.search);
+/* hide 支持两种写法：id（grain）与 CSS 选择器（.crowd / [data-paper]）。
+   选择器是为二分定位准备的：一行关掉所有海水纸层，就能立刻分清
+   「这块奇怪的东西」是纸层画的，还是母题（船/鲸/路人）画的。 */
+(_Q.get('hide') || '').split(',').map(s => s.trim()).filter(Boolean).forEach(k => {
+  if (/^[.#\[]/.test(k)) {
+    try { document.querySelectorAll(k).forEach(e => { e.style.display = 'none'; }); } catch (e) {}
+  } else {
+    const e = document.getElementById(k); if (e) e.style.display = 'none';
+  }
+});
+seek(_Q.has('t') ? clamp(Number(_Q.get('t')) || 0, 0, 1) : 0);
+const done = () => { window.__ready = true; };
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(done).catch(done);
+else done();
+window.addEventListener('error', e => { window.__error = String(e.message); });
+
+</script>
+</body>
+</html>

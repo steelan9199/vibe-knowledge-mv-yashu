@@ -1,0 +1,31 @@
+{
+  "_note": "30s 档模板（9 镜 = 九镜弧跑一轮，平均 3.33s/镜）。真实任务只换歌词与 dur，scenes 的 type 顺序不动。歌词为占位词。",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "duration": 30.0,
+  "bpm": 128,
+  "offset": 0,
+  "charSnap": false,
+  "scenes": [
+    { "type": "sail",   "dur": 3.4 },
+    { "type": "night",  "dur": 2.6 },
+    { "type": "miss",   "dur": 3.2 },
+    { "type": "brave",  "dur": 3.6 },
+    { "type": "dock",   "dur": 3.6 },
+    { "type": "leave",  "dur": 3.4 },
+    { "type": "thanks", "dur": 3.2 },
+    { "type": "eyes",   "dur": 3.2 },
+    { "type": "end",    "dur": 3.8 }
+  ],
+  "lyrics": [
+    { "text": "纸做的月亮",   "start": 0.15, "end": 3.3 },
+    { "text": "也会落进海里", "start": 3.6,  "end": 5.9 },
+    { "text": "我提着灯",     "start": 6.2,  "end": 9.1 },
+    { "text": "往你那边走",   "start": 9.4,  "end": 12.7 },
+    { "text": "风把浪举高",   "start": 13.0, "end": 16.2 },
+    { "text": "又轻轻放回",   "start": 16.6, "end": 19.7 },
+    { "text": "灯一盏一盏",   "start": 20.0, "end": 22.9 },
+    { "text": "亮在你眼里",   "start": 23.2, "end": 26.0 }
+  ]
+}
